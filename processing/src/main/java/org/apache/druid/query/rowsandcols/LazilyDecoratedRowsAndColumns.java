@@ -21,7 +21,6 @@ package org.apache.druid.query.rowsandcols;
 
 import com.google.common.collect.ImmutableList;
 import org.apache.druid.frame.Frame;
-import org.apache.druid.frame.FrameType;
 import org.apache.druid.frame.allocation.ArenaMemoryAllocatorFactory;
 import org.apache.druid.frame.key.KeyColumn;
 import org.apache.druid.frame.key.KeyOrder;
@@ -40,7 +39,7 @@ import org.apache.druid.query.operator.ColumnWithDirection;
 import org.apache.druid.query.operator.OffsetLimit;
 import org.apache.druid.query.rowsandcols.column.Column;
 import org.apache.druid.query.rowsandcols.column.ColumnAccessor;
-import org.apache.druid.query.rowsandcols.concrete.FrameRowsAndColumns;
+import org.apache.druid.query.rowsandcols.concrete.ColumnBasedFrameRowsAndColumns;
 import org.apache.druid.query.rowsandcols.semantic.ColumnSelectorFactoryMaker;
 import org.apache.druid.query.rowsandcols.semantic.DefaultRowsAndColumnsDecorator;
 import org.apache.druid.query.rowsandcols.semantic.RowsAndColumnsDecorator;
@@ -67,8 +66,8 @@ import java.util.function.Function;
 
 public class LazilyDecoratedRowsAndColumns implements RowsAndColumns
 {
-  private static final Map<Class<?>, Function<LazilyDecoratedRowsAndColumns, ?>> AS_MAP =
-      RowsAndColumns.makeAsMap(LazilyDecoratedRowsAndColumns.class);
+  private static final Map<Class<?>, Function<LazilyDecoratedRowsAndColumns, ?>> AS_MAP = RowsAndColumns
+      .makeAsMap(LazilyDecoratedRowsAndColumns.class);
 
   private RowsAndColumns base;
   private Interval interval;
@@ -169,7 +168,7 @@ public class LazilyDecoratedRowsAndColumns implements RowsAndColumns
       if (thePair == null) {
         reset(new EmptyRowsAndColumns());
       } else {
-        reset(new FrameRowsAndColumns(Frame.wrap(thePair.lhs), thePair.rhs));
+        reset(new ColumnBasedFrameRowsAndColumns(Frame.wrap(thePair.lhs), thePair.rhs));
       }
     }
   }
@@ -225,9 +224,9 @@ public class LazilyDecoratedRowsAndColumns implements RowsAndColumns
         cols = base.getColumnNames();
       } else {
         cols = ImmutableList.<String>builder()
-            .addAll(base.getColumnNames())
-            .addAll(virtualColumns.getColumnNames())
-            .build();
+                            .addAll(base.getColumnNames())
+                            .addAll(virtualColumns.getColumnNames())
+                            .build();
       }
     }
     AtomicReference<RowSignature> siggy = new AtomicReference<>(null);
@@ -246,18 +245,15 @@ public class LazilyDecoratedRowsAndColumns implements RowsAndColumns
       final RowSignature.Builder sigBob = RowSignature.builder();
 
       for (String col : cols) {
-        ColumnCapabilities capabilities;
-        capabilities = columnSelectorFactory.getColumnCapabilities(col);
+        final ColumnCapabilities capabilities;
+        if (virtualColumns != null) {
+          capabilities = virtualColumns.getColumnCapabilitiesWithFallback(columnSelectorFactory, col);
+        } else {
+          capabilities = columnSelectorFactory.getColumnCapabilities(col);
+        }
+
         if (capabilities != null) {
           sigBob.add(col, capabilities.toColumnType());
-          continue;
-        }
-        if (virtualColumns != null) {
-          capabilities = virtualColumns.getColumnCapabilities(columnSelectorFactory, col);
-          if (capabilities != null) {
-            sigBob.add(col, capabilities.toColumnType());
-            continue;
-          }
         }
       }
       final RowSignature signature = sigBob.build();
@@ -278,8 +274,7 @@ public class LazilyDecoratedRowsAndColumns implements RowsAndColumns
         }
       }
 
-      final FrameWriterFactory frameWriterFactory = FrameWriters.makeFrameWriterFactory(
-          FrameType.COLUMNAR,
+      final FrameWriterFactory frameWriterFactory = FrameWriters.makeColumnBasedFrameWriterFactory(
           new ArenaMemoryAllocatorFactory(200 << 20), // 200 MB, because, why not?
           signature,
           sortColumns
@@ -395,8 +390,7 @@ public class LazilyDecoratedRowsAndColumns implements RowsAndColumns
     long remainingRowsToSkip = limit.getOffset();
     long remainingRowsToFetch = limit.getLimitOrMax();
 
-    final FrameWriter frameWriter = FrameWriters.makeFrameWriterFactory(
-        FrameType.COLUMNAR,
+    final FrameWriter frameWriter = FrameWriters.makeColumnBasedFrameWriterFactory(
         memFactory,
         sigBob.build(),
         Collections.emptyList()

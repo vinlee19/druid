@@ -118,7 +118,7 @@ Returns a list of all segments for each datasource with the full segment metadat
 
 `GET /druid/coordinator/v1/metadata/segments?includeOvershadowedStatus&includeRealtimeSegments`
 
-Returns a list of all published and realtime segments for each datasource with the full segment metadata and extra fields `overshadowed`,`realtime` & `numRows`. Realtime segments are returned only when `druid.coordinator.centralizedTableSchema.enabled` is set on the Coordinator. 
+Returns a list of all published and realtime segments for each datasource with the full segment metadata and extra fields `overshadowed`,`realtime` & `numRows`. Realtime segments are returned only when `druid.centralizedDatasourceSchema.enabled` is set on the Coordinator. 
 
 `GET /druid/coordinator/v1/metadata/segments?includeOvershadowedStatus&datasources={dataSourceName1}&datasources={dataSourceName2}`
 
@@ -126,7 +126,7 @@ Returns a list of all segments for one or more specific datasources with the ful
 
 `GET /druid/coordinator/v1/metadata/segments?includeOvershadowedStatus&includeRealtimeSegments&datasources={dataSourceName1}&datasources={dataSourceName2}`
 
-Returns a list of all published and realtime segments for the specified datasources with the full segment metadata and extra fields `overshadwed`,`realtime` & `numRows`. Realtime segments are returned only when `druid.coordinator.centralizedTableSchema.enabled` is set on the Coordinator.
+Returns a list of all published and realtime segments for the specified datasources with the full segment metadata and extra fields `overshadwed`,`realtime` & `numRows`. Realtime segments are returned only when `druid.centralizedDatasourceSchema.enabled` is set on the Coordinator.
 
 `GET /druid/coordinator/v1/metadata/datasources`
 
@@ -163,7 +163,7 @@ segment is unused, or is unknown, a 404 response is returned.
 
 `GET /druid/coordinator/v1/metadata/datasources/{dataSourceName}/segments/{segmentId}?includeUnused=true`
 
-Returns full segment metadata for a specific segment as stored in the metadata store. If the is unknown, a 404 response 
+Returns full segment metadata for a specific segment as stored in the metadata store. If it is unknown, a 404 response
 is returned.
 
 `GET /druid/coordinator/v1/metadata/datasources/{dataSourceName}/segments`
@@ -176,7 +176,11 @@ Returns a list of all segments, overlapping with any of given intervals, for a d
 
 `POST /druid/coordinator/v1/metadata/dataSourceInformation`
 
-Returns information about the specified datasources, including the datasource schema.  
+Returns information about the specified datasources, including the datasource schema.
+
+`POST /druid/coordinator/v1/metadata/bootstrapSegments`
+
+Returns information about bootstrap segments for all datasources. The returned set includes all broadcast segments if broadcast rules are configured.
 
 <a name="coordinator-datasources"></a>
 
@@ -289,7 +293,7 @@ Returns a list of server data objects in which each object has the following key
 
 ## Query server
 
-This section documents the API endpoints for the processes that reside on Query servers (Brokers) in the suggested [three-server configuration](../design/processes.md#server-types).
+This section documents the API endpoints for the services that reside on Query servers (Brokers) in the suggested [three-server configuration](../design/architecture.md#druid-servers).
 
 ### Broker
 

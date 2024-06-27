@@ -22,27 +22,24 @@ package org.apache.druid.sql.calcite;
 import com.google.common.collect.ImmutableList;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSet;
-import com.google.inject.Injector;
+import org.apache.calcite.avatica.SqlType;
 import org.apache.druid.common.config.NullHandling;
-import org.apache.druid.data.input.ResourceInputSource;
 import org.apache.druid.guice.DruidInjectorBuilder;
 import org.apache.druid.guice.NestedDataModule;
 import org.apache.druid.java.util.common.HumanReadableBytes;
 import org.apache.druid.java.util.common.Intervals;
 import org.apache.druid.java.util.common.StringUtils;
 import org.apache.druid.java.util.common.granularity.Granularities;
+import org.apache.druid.math.expr.ExprEval;
 import org.apache.druid.math.expr.ExprMacroTable;
-import org.apache.druid.query.DataSource;
+import org.apache.druid.math.expr.ExpressionType;
 import org.apache.druid.query.Druids;
 import org.apache.druid.query.FilteredDataSource;
-import org.apache.druid.query.FrameBasedInlineDataSource;
 import org.apache.druid.query.InlineDataSource;
 import org.apache.druid.query.LookupDataSource;
-import org.apache.druid.query.NestedDataTestUtils;
 import org.apache.druid.query.Query;
 import org.apache.druid.query.QueryContexts;
 import org.apache.druid.query.QueryDataSource;
-import org.apache.druid.query.QueryRunnerFactoryConglomerate;
 import org.apache.druid.query.TableDataSource;
 import org.apache.druid.query.UnnestDataSource;
 import org.apache.druid.query.aggregation.CountAggregatorFactory;
@@ -50,9 +47,11 @@ import org.apache.druid.query.aggregation.DoubleSumAggregatorFactory;
 import org.apache.druid.query.aggregation.ExpressionLambdaAggregatorFactory;
 import org.apache.druid.query.aggregation.FilteredAggregatorFactory;
 import org.apache.druid.query.aggregation.LongSumAggregatorFactory;
+import org.apache.druid.query.aggregation.post.ExpressionPostAggregator;
 import org.apache.druid.query.dimension.DefaultDimensionSpec;
 import org.apache.druid.query.expression.TestExprMacroTable;
 import org.apache.druid.query.extraction.SubstringDimExtractionFn;
+import org.apache.druid.query.filter.ArrayContainsElementFilter;
 import org.apache.druid.query.filter.ExpressionDimFilter;
 import org.apache.druid.query.filter.InDimFilter;
 import org.apache.druid.query.filter.LikeDimFilter;
@@ -61,35 +60,24 @@ import org.apache.druid.query.groupby.having.DimFilterHavingSpec;
 import org.apache.druid.query.groupby.orderby.DefaultLimitSpec;
 import org.apache.druid.query.groupby.orderby.NoopLimitSpec;
 import org.apache.druid.query.groupby.orderby.OrderByColumnSpec;
-import org.apache.druid.query.lookup.LookupExtractorFactoryContainerProvider;
 import org.apache.druid.query.ordering.StringComparators;
 import org.apache.druid.query.scan.ScanQuery;
+import org.apache.druid.query.spec.MultipleIntervalSegmentSpec;
 import org.apache.druid.query.topn.DimensionTopNMetricSpec;
 import org.apache.druid.query.topn.TopNQueryBuilder;
-import org.apache.druid.segment.FrameBasedInlineSegmentWrangler;
-import org.apache.druid.segment.IndexBuilder;
-import org.apache.druid.segment.InlineSegmentWrangler;
-import org.apache.druid.segment.LookupSegmentWrangler;
-import org.apache.druid.segment.MapSegmentWrangler;
-import org.apache.druid.segment.QueryableIndex;
-import org.apache.druid.segment.SegmentWrangler;
+import org.apache.druid.segment.VirtualColumns;
 import org.apache.druid.segment.column.ColumnType;
 import org.apache.druid.segment.column.RowSignature;
-import org.apache.druid.segment.incremental.IncrementalIndexSchema;
 import org.apache.druid.segment.join.JoinType;
-import org.apache.druid.segment.join.JoinableFactoryWrapper;
-import org.apache.druid.segment.writeout.OffHeapMemorySegmentWriteOutMediumFactory;
-import org.apache.druid.server.QueryStackTests;
-import org.apache.druid.server.SpecificSegmentsQuerySegmentWalker;
+import org.apache.druid.segment.virtual.ExpressionVirtualColumn;
+import org.apache.druid.sql.calcite.CalciteArraysQueryTest.ArraysComponentSupplier;
 import org.apache.druid.sql.calcite.filtration.Filtration;
 import org.apache.druid.sql.calcite.util.CalciteTests;
-import org.apache.druid.sql.calcite.util.TestDataBuilder;
-import org.apache.druid.timeline.DataSegment;
-import org.apache.druid.timeline.partition.LinearShardSpec;
+import org.apache.druid.sql.calcite.util.SqlTestFramework.StandardComponentSupplier;
+import org.apache.druid.sql.http.SqlParameter;
 import org.junit.Assert;
-import org.junit.Test;
+import org.junit.jupiter.api.Test;
 
-import java.io.IOException;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -98,6 +86,7 @@ import java.util.Map;
 /**
  * Tests for array functions and array types
  */
+@SqlTestFrameworkConfig.ComponentSupplier(ArraysComponentSupplier.class)
 public class CalciteArraysQueryTest extends BaseCalciteQueryTest
 {
   private static final Map<String, Object> QUERY_CONTEXT_UNNEST =
@@ -105,9 +94,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
                   .putAll(QUERY_CONTEXT_DEFAULT)
                   .put(QueryContexts.CTX_SQL_STRINGIFY_ARRAYS, false)
                   .build();
-
-
-  public static final String DATA_SOURCE_ARRAYS = "arrays";
 
   public static void assertResultsDeepEquals(String sql, List<Object[]> expected, List<Object[]> results)
   {
@@ -133,125 +119,19 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
     }
   }
 
-  @Override
-  public void configureGuice(DruidInjectorBuilder builder)
+  protected static class ArraysComponentSupplier extends StandardComponentSupplier
   {
-    super.configureGuice(builder);
-    builder.addModule(new NestedDataModule());
-  }
+    public ArraysComponentSupplier(TempDirProducer tempFolderProducer)
+    {
+      super(tempFolderProducer);
+    }
 
-  @SuppressWarnings("resource")
-  @Override
-  public SpecificSegmentsQuerySegmentWalker createQuerySegmentWalker(
-      final QueryRunnerFactoryConglomerate conglomerate,
-      final JoinableFactoryWrapper joinableFactory,
-      final Injector injector
-  ) throws IOException
-  {
-    NestedDataModule.registerHandlersAndSerde();
-
-    final QueryableIndex foo = IndexBuilder
-        .create()
-        .tmpDir(temporaryFolder.newFolder())
-        .segmentWriteOutMediumFactory(OffHeapMemorySegmentWriteOutMediumFactory.instance())
-        .schema(TestDataBuilder.INDEX_SCHEMA)
-        .rows(TestDataBuilder.ROWS1)
-        .buildMMappedIndex();
-
-    final QueryableIndex numfoo = IndexBuilder
-        .create()
-        .tmpDir(temporaryFolder.newFolder())
-        .segmentWriteOutMediumFactory(OffHeapMemorySegmentWriteOutMediumFactory.instance())
-        .schema(TestDataBuilder.INDEX_SCHEMA_NUMERIC_DIMS)
-        .rows(TestDataBuilder.ROWS1_WITH_NUMERIC_DIMS)
-        .buildMMappedIndex();
-
-    final QueryableIndex indexLotsOfColumns = IndexBuilder
-        .create()
-        .tmpDir(temporaryFolder.newFolder())
-        .segmentWriteOutMediumFactory(OffHeapMemorySegmentWriteOutMediumFactory.instance())
-        .schema(TestDataBuilder.INDEX_SCHEMA_LOTS_O_COLUMNS)
-        .rows(TestDataBuilder.ROWS_LOTS_OF_COLUMNS)
-        .buildMMappedIndex();
-
-    final QueryableIndex indexArrays =
-        IndexBuilder.create()
-                    .tmpDir(temporaryFolder.newFolder())
-                    .segmentWriteOutMediumFactory(OffHeapMemorySegmentWriteOutMediumFactory.instance())
-                    .schema(
-                        new IncrementalIndexSchema.Builder()
-                            .withTimestampSpec(NestedDataTestUtils.AUTO_SCHEMA.getTimestampSpec())
-                            .withDimensionsSpec(NestedDataTestUtils.AUTO_SCHEMA.getDimensionsSpec())
-                            .withMetrics(
-                                new CountAggregatorFactory("cnt")
-                            )
-                            .withRollup(false)
-                            .build()
-                    )
-                    .inputSource(
-                        ResourceInputSource.of(
-                            NestedDataTestUtils.class.getClassLoader(),
-                            NestedDataTestUtils.ARRAY_TYPES_DATA_FILE
-                        )
-                    )
-                    .inputFormat(TestDataBuilder.DEFAULT_JSON_INPUT_FORMAT)
-                    .inputTmpDir(temporaryFolder.newFolder())
-                    .buildMMappedIndex();
-
-    SpecificSegmentsQuerySegmentWalker walker = new SpecificSegmentsQuerySegmentWalker(
-        conglomerate,
-        new MapSegmentWrangler(
-            ImmutableMap.<Class<? extends DataSource>, SegmentWrangler>builder()
-                        .put(InlineDataSource.class, new InlineSegmentWrangler())
-                        .put(FrameBasedInlineDataSource.class, new FrameBasedInlineSegmentWrangler())
-                        .put(
-                            LookupDataSource.class,
-                            new LookupSegmentWrangler(injector.getInstance(LookupExtractorFactoryContainerProvider.class))
-                        )
-                        .build()
-        ),
-        joinableFactory,
-        QueryStackTests.DEFAULT_NOOP_SCHEDULER
-    );
-    walker.add(
-        DataSegment.builder()
-                   .dataSource(CalciteTests.DATASOURCE1)
-                   .interval(foo.getDataInterval())
-                   .version("1")
-                   .shardSpec(new LinearShardSpec(0))
-                   .size(0)
-                   .build(),
-        foo
-    ).add(
-        DataSegment.builder()
-                   .dataSource(CalciteTests.DATASOURCE3)
-                   .interval(numfoo.getDataInterval())
-                   .version("1")
-                   .shardSpec(new LinearShardSpec(0))
-                   .size(0)
-                   .build(),
-        numfoo
-    ).add(
-        DataSegment.builder()
-                   .dataSource(CalciteTests.DATASOURCE5)
-                   .interval(indexLotsOfColumns.getDataInterval())
-                   .version("1")
-                   .shardSpec(new LinearShardSpec(0))
-                   .size(0)
-                   .build(),
-        indexLotsOfColumns
-    ).add(
-        DataSegment.builder()
-                   .dataSource(DATA_SOURCE_ARRAYS)
-                   .version("1")
-                   .interval(indexArrays.getDataInterval())
-                   .shardSpec(new LinearShardSpec(1))
-                   .size(0)
-                   .build(),
-        indexArrays
-    );
-
-    return walker;
+    @Override
+    public void configureGuice(DruidInjectorBuilder builder)
+    {
+      super.configureGuice(builder);
+      builder.addModule(new NestedDataModule());
+    }
   }
 
   // test some query stuffs, sort of limited since no native array column types so either need to use constructor or
@@ -316,7 +196,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         QUERY_CONTEXT_NO_STRINGIFY_ARRAY,
         ImmutableList.of(
             GroupByQuery.builder()
-                        .setDataSource(DATA_SOURCE_ARRAYS)
+                        .setDataSource(CalciteTests.ARRAYS_DATASOURCE)
                         .setInterval(querySegmentSpec(Filtration.eternity()))
                         .setVirtualColumns(expressionVirtualColumn(
                             "v0",
@@ -641,7 +521,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         + " FROM druid.arrays",
         ImmutableList.of(
             newScanQueryBuilder()
-                .dataSource(DATA_SOURCE_ARRAYS)
+                .dataSource(CalciteTests.ARRAYS_DATASOURCE)
                 .intervals(querySegmentSpec(Filtration.eternity()))
                 .virtualColumns(
                     // these report as strings even though they are not, someday this will not be so
@@ -836,7 +716,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
             newScanQueryBuilder()
                 .dataSource(CalciteTests.DATASOURCE3)
                 .intervals(querySegmentSpec(Filtration.eternity()))
-                .filters(new InDimFilter("dim3", ImmutableList.of("a", "b"), null))
+                .filters(in("dim3", ImmutableList.of("a", "b")))
                 .columns("dim3")
                 .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
                 .limit(5)
@@ -857,9 +737,14 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         "SELECT arrayStringNulls FROM druid.arrays WHERE ARRAY_OVERLAP(arrayStringNulls, ARRAY['a','b']) LIMIT 5",
         ImmutableList.of(
             newScanQueryBuilder()
-                .dataSource(DATA_SOURCE_ARRAYS)
+                .dataSource(CalciteTests.ARRAYS_DATASOURCE)
                 .intervals(querySegmentSpec(Filtration.eternity()))
-                .filters(expressionFilter("array_overlap(\"arrayStringNulls\",array('a','b'))"))
+                .filters(
+                    or(
+                        new ArrayContainsElementFilter("arrayStringNulls", ColumnType.STRING, "a", null),
+                        new ArrayContainsElementFilter("arrayStringNulls", ColumnType.STRING, "b", null)
+                    )
+                )
                 .columns("arrayStringNulls")
                 .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
                 .limit(5)
@@ -883,9 +768,14 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         "SELECT arrayLongNulls FROM druid.arrays WHERE ARRAY_OVERLAP(arrayLongNulls, ARRAY[1, 2]) LIMIT 5",
         ImmutableList.of(
             newScanQueryBuilder()
-                .dataSource(DATA_SOURCE_ARRAYS)
+                .dataSource(CalciteTests.ARRAYS_DATASOURCE)
                 .intervals(querySegmentSpec(Filtration.eternity()))
-                .filters(expressionFilter("array_overlap(\"arrayLongNulls\",array(1,2))"))
+                .filters(
+                    or(
+                        new ArrayContainsElementFilter("arrayLongNulls", ColumnType.LONG, 1L, null),
+                        new ArrayContainsElementFilter("arrayLongNulls", ColumnType.LONG, 2L, null)
+                    )
+                )
                 .columns("arrayLongNulls")
                 .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
                 .limit(5)
@@ -909,9 +799,14 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         "SELECT arrayDoubleNulls FROM druid.arrays WHERE ARRAY_OVERLAP(arrayDoubleNulls, ARRAY[1.1, 2.2]) LIMIT 5",
         ImmutableList.of(
             newScanQueryBuilder()
-                .dataSource(DATA_SOURCE_ARRAYS)
+                .dataSource(CalciteTests.ARRAYS_DATASOURCE)
                 .intervals(querySegmentSpec(Filtration.eternity()))
-                .filters(expressionFilter("array_overlap(\"arrayDoubleNulls\",array(1.1,2.2))"))
+                .filters(
+                    or(
+                        new ArrayContainsElementFilter("arrayDoubleNulls", ColumnType.DOUBLE, 1.1, null),
+                        new ArrayContainsElementFilter("arrayDoubleNulls", ColumnType.DOUBLE, 2.2, null)
+                    )
+                )
                 .columns("arrayDoubleNulls")
                 .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
                 .limit(5)
@@ -938,9 +833,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
                 .dataSource(CalciteTests.DATASOURCE3)
                 .intervals(querySegmentSpec(Filtration.eternity()))
                 .filters(
-                    NullHandling.sqlCompatible()
-                    ? expressionFilter("array_overlap(substring(\"dim3\", 0, 1),array('a','b'))")
-                    : new InDimFilter("dim3", ImmutableList.of("a", "b"), new SubstringDimExtractionFn(0, 1))
+                    new InDimFilter("dim3", ImmutableList.of("a", "b"), new SubstringDimExtractionFn(0, 1))
                 )
                 .columns("dim3")
                 .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
@@ -984,7 +877,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         "SELECT arrayStringNulls, arrayString FROM druid.arrays WHERE ARRAY_OVERLAP(arrayStringNulls, arrayString) LIMIT 5",
         ImmutableList.of(
             newScanQueryBuilder()
-                .dataSource(DATA_SOURCE_ARRAYS)
+                .dataSource(CalciteTests.ARRAYS_DATASOURCE)
                 .intervals(querySegmentSpec(Filtration.eternity()))
                 .filters(expressionFilter("array_overlap(\"arrayStringNulls\",\"arrayString\")"))
                 .columns("arrayString", "arrayStringNulls")
@@ -1010,7 +903,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         "SELECT arrayLongNulls, arrayLong FROM druid.arrays WHERE ARRAY_OVERLAP(arrayLongNulls, arrayLong) LIMIT 5",
         ImmutableList.of(
             newScanQueryBuilder()
-                .dataSource(DATA_SOURCE_ARRAYS)
+                .dataSource(CalciteTests.ARRAYS_DATASOURCE)
                 .intervals(querySegmentSpec(Filtration.eternity()))
                 .filters(expressionFilter("array_overlap(\"arrayLongNulls\",\"arrayLong\")"))
                 .columns("arrayLong", "arrayLongNulls")
@@ -1036,7 +929,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         "SELECT arrayDoubleNulls, arrayDouble FROM druid.arrays WHERE ARRAY_OVERLAP(arrayDoubleNulls, arrayDouble) LIMIT 5",
         ImmutableList.of(
             newScanQueryBuilder()
-                .dataSource(DATA_SOURCE_ARRAYS)
+                .dataSource(CalciteTests.ARRAYS_DATASOURCE)
                 .intervals(querySegmentSpec(Filtration.eternity()))
                 .filters(expressionFilter("array_overlap(\"arrayDoubleNulls\",\"arrayDouble\")"))
                 .columns("arrayDouble", "arrayDoubleNulls")
@@ -1051,6 +944,40 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
             new Object[]{"[1.1,2.2,null]", "[1.1,2.2,3.3]"},
             new Object[]{"[999.0,null,5.5]", "[3.3,4.4,5.5]"}
         )
+    );
+  }
+
+  @Test
+  public void testArrayOverlapFilterWithDynamicParameter()
+  {
+    Druids.ScanQueryBuilder builder = newScanQueryBuilder()
+            .dataSource(CalciteTests.DATASOURCE3)
+            .intervals(querySegmentSpec(Filtration.eternity()))
+            .filters(expressionFilter("array_overlap(array(1.0,1.7,null),array(\"d1\"))"))
+            .columns("dim3")
+            .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
+            .limit(5)
+            .context(QUERY_CONTEXT_DEFAULT);
+
+    testQuery(
+            PLANNER_CONFIG_DEFAULT,
+            QUERY_CONTEXT_DEFAULT,
+            ImmutableList.of(
+                    new SqlParameter(SqlType.ARRAY, Arrays.asList(1.0, 1.7, null))
+            ),
+            "SELECT dim3 FROM druid.numfoo WHERE ARRAY_OVERLAP(?, ARRAY[d1]) LIMIT 5",
+            CalciteTests.REGULAR_USER_AUTH_RESULT,
+            ImmutableList.of(builder.build()),
+            NullHandling.sqlCompatible() ? ImmutableList.of(
+                    new Object[]{"[\"a\",\"b\"]"},
+                    new Object[]{"[\"b\",\"c\"]"},
+                    new Object[]{""},
+                    new Object[]{null},
+                    new Object[]{null}
+            ) : ImmutableList.of(
+                    new Object[]{"[\"a\",\"b\"]"},
+                    new Object[]{"[\"b\",\"c\"]"}
+            )
     );
   }
 
@@ -1088,10 +1015,14 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         "SELECT arrayStringNulls FROM druid.arrays WHERE ARRAY_CONTAINS(arrayStringNulls, ARRAY['a','b']) LIMIT 5",
         ImmutableList.of(
             newScanQueryBuilder()
-                .dataSource(DATA_SOURCE_ARRAYS)
+                .dataSource(CalciteTests.ARRAYS_DATASOURCE)
                 .intervals(querySegmentSpec(Filtration.eternity()))
                 .filters(
-                    expressionFilter("array_contains(\"arrayStringNulls\",array('a','b'))")
+                    and(
+                        new ArrayContainsElementFilter("arrayStringNulls", ColumnType.STRING, "a", null),
+                        new ArrayContainsElementFilter("arrayStringNulls", ColumnType.STRING, "b", null)
+                    )
+
                 )
                 .columns("arrayStringNulls")
                 .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
@@ -1114,10 +1045,13 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         "SELECT arrayLongNulls FROM druid.arrays WHERE ARRAY_CONTAINS(arrayLongNulls, ARRAY[1, null]) LIMIT 5",
         ImmutableList.of(
             newScanQueryBuilder()
-                .dataSource(DATA_SOURCE_ARRAYS)
+                .dataSource(CalciteTests.ARRAYS_DATASOURCE)
                 .intervals(querySegmentSpec(Filtration.eternity()))
                 .filters(
-                    expressionFilter("array_contains(\"arrayLongNulls\",array(1,null))")
+                    and(
+                        new ArrayContainsElementFilter("arrayLongNulls", ColumnType.LONG, 1L, null),
+                        new ArrayContainsElementFilter("arrayLongNulls", ColumnType.LONG, null, null)
+                    )
                 )
                 .columns("arrayLongNulls")
                 .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
@@ -1139,10 +1073,13 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         "SELECT arrayDoubleNulls FROM druid.arrays WHERE ARRAY_CONTAINS(arrayDoubleNulls, ARRAY[1.1, null]) LIMIT 5",
         ImmutableList.of(
             newScanQueryBuilder()
-                .dataSource(DATA_SOURCE_ARRAYS)
+                .dataSource(CalciteTests.ARRAYS_DATASOURCE)
                 .intervals(querySegmentSpec(Filtration.eternity()))
                 .filters(
-                    expressionFilter("array_contains(\"arrayDoubleNulls\",array(1.1,null))")
+                    and(
+                        new ArrayContainsElementFilter("arrayDoubleNulls", ColumnType.DOUBLE, 1.1, null),
+                        new ArrayContainsElementFilter("arrayDoubleNulls", ColumnType.DOUBLE, null, null)
+                    )
                 )
                 .columns("arrayDoubleNulls")
                 .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
@@ -1161,26 +1098,33 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testArrayContainsFilterWithExtractionFn()
   {
+    Druids.ScanQueryBuilder builder = newScanQueryBuilder()
+        .dataSource(CalciteTests.DATASOURCE3)
+        .intervals(querySegmentSpec(Filtration.eternity()))
+        .columns("dim3")
+        .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
+        .limit(5)
+        .context(QUERY_CONTEXT_DEFAULT);
+
+    if (NullHandling.sqlCompatible()) {
+      builder = builder.virtualColumns(expressionVirtualColumn("v0", "substring(\"dim3\", 0, 1)", ColumnType.STRING))
+                       .filters(
+                           and(
+                               equality("v0", "a", ColumnType.STRING),
+                               equality("v0", "b", ColumnType.STRING)
+                           )
+                       );
+    } else {
+      builder = builder.filters(
+          and(
+              selector("dim3", "a", new SubstringDimExtractionFn(0, 1)),
+              selector("dim3", "b", new SubstringDimExtractionFn(0, 1))
+          )
+      );
+    }
     testQuery(
         "SELECT dim3 FROM druid.numfoo WHERE ARRAY_CONTAINS(SUBSTRING(dim3, 1, 1), ARRAY['a','b']) LIMIT 5",
-        ImmutableList.of(
-            newScanQueryBuilder()
-                .dataSource(CalciteTests.DATASOURCE3)
-                .intervals(querySegmentSpec(Filtration.eternity()))
-                .filters(
-                    NullHandling.sqlCompatible()
-                    ? expressionFilter("array_contains(substring(\"dim3\", 0, 1),array('a','b'))")
-                    : and(
-                        selector("dim3", "a", new SubstringDimExtractionFn(0, 1)),
-                        selector("dim3", "b", new SubstringDimExtractionFn(0, 1))
-                    )
-                )
-                .columns("dim3")
-                .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
-                .limit(5)
-                .context(QUERY_CONTEXT_DEFAULT)
-                .build()
-        ),
+        ImmutableList.of(builder.build()),
         ImmutableList.of(
             new Object[]{"[\"a\",\"b\"]"}
         )
@@ -1239,7 +1183,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         "SELECT arrayStringNulls, arrayString FROM druid.arrays WHERE ARRAY_CONTAINS(arrayStringNulls, arrayString) LIMIT 5",
         ImmutableList.of(
             newScanQueryBuilder()
-                .dataSource(DATA_SOURCE_ARRAYS)
+                .dataSource(CalciteTests.ARRAYS_DATASOURCE)
                 .intervals(querySegmentSpec(Filtration.eternity()))
                 .filters(
                     expressionFilter("array_contains(\"arrayStringNulls\",\"arrayString\")")
@@ -1257,13 +1201,42 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   }
 
   @Test
+  public void testArrayContainsArrayStringColumns()
+  {
+    testQuery(
+        "SELECT ARRAY_CONTAINS(arrayStringNulls, ARRAY['a', 'b']), ARRAY_CONTAINS(arrayStringNulls, arrayString) FROM druid.arrays LIMIT 5",
+        ImmutableList.of(
+            newScanQueryBuilder()
+                .dataSource(CalciteTests.ARRAYS_DATASOURCE)
+                .intervals(querySegmentSpec(Filtration.eternity()))
+                .columns("v0", "v1")
+                .virtualColumns(
+                    expressionVirtualColumn("v0", "array_contains(\"arrayStringNulls\",array('a','b'))", ColumnType.LONG),
+                    expressionVirtualColumn("v1", "array_contains(\"arrayStringNulls\",\"arrayString\")", ColumnType.LONG)
+                )
+                .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
+                .limit(5)
+                .context(QUERY_CONTEXT_DEFAULT)
+                .build()
+        ),
+        ImmutableList.of(
+            new Object[]{NullHandling.sqlCompatible() ? null : false, NullHandling.sqlCompatible() ? null : false},
+            new Object[]{true, false},
+            new Object[]{false, false},
+            new Object[]{NullHandling.sqlCompatible() ? null : false, NullHandling.sqlCompatible() ? null : false},
+            new Object[]{true, true}
+        )
+    );
+  }
+
+  @Test
   public void testArrayContainsFilterArrayLongColumns()
   {
     testQuery(
         "SELECT arrayLong, arrayLongNulls FROM druid.arrays WHERE ARRAY_CONTAINS(arrayLong, arrayLongNulls) LIMIT 5",
         ImmutableList.of(
             newScanQueryBuilder()
-                .dataSource(DATA_SOURCE_ARRAYS)
+                .dataSource(CalciteTests.ARRAYS_DATASOURCE)
                 .intervals(querySegmentSpec(Filtration.eternity()))
                 .filters(
                     expressionFilter("array_contains(\"arrayLong\",\"arrayLongNulls\")")
@@ -1290,7 +1263,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         "SELECT arrayDoubleNulls, arrayDouble FROM druid.arrays WHERE ARRAY_CONTAINS(arrayDoubleNulls, arrayDouble) LIMIT 5",
         ImmutableList.of(
             newScanQueryBuilder()
-                .dataSource(DATA_SOURCE_ARRAYS)
+                .dataSource(CalciteTests.ARRAYS_DATASOURCE)
                 .intervals(querySegmentSpec(Filtration.eternity()))
                 .filters(
                     expressionFilter("array_contains(\"arrayDoubleNulls\",\"arrayDouble\")")
@@ -1303,6 +1276,204 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         ),
         ImmutableList.of()
     );
+  }
+
+  @Test
+  public void testArrayContainsConstantNull()
+  {
+    testQuery(
+        "SELECT ARRAY_CONTAINS(null, ARRAY['a','b'])",
+        ImmutableList.of(
+            NullHandling.sqlCompatible()
+            ? newScanQueryBuilder()
+                .dataSource(
+                    InlineDataSource.fromIterable(
+                        ImmutableList.of(new Object[]{NullHandling.defaultLongValue()}),
+                        RowSignature.builder().add("EXPR$0", ColumnType.LONG).build()
+                    )
+                )
+                .intervals(querySegmentSpec(Filtration.eternity()))
+                .columns("EXPR$0")
+                .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
+                .context(QUERY_CONTEXT_DEFAULT)
+                .build()
+            : newScanQueryBuilder()
+                .dataSource(
+                    InlineDataSource.fromIterable(
+                        ImmutableList.of(new Object[]{0L}),
+                        RowSignature.builder().add("ZERO", ColumnType.LONG).build()
+                    )
+                )
+                .virtualColumns(expressionVirtualColumn("v0", "0", ColumnType.LONG))
+                .intervals(querySegmentSpec(Filtration.eternity()))
+                .columns("v0")
+                .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
+                .context(QUERY_CONTEXT_DEFAULT)
+                .build()
+        ),
+        ImmutableList.of(
+            new Object[]{NullHandling.sqlCompatible() ? null : false}
+        )
+    );
+  }
+
+  @Test
+  public void testArrayContainsFilterWithDynamicParameter()
+  {
+    Druids.ScanQueryBuilder builder = newScanQueryBuilder()
+            .dataSource(CalciteTests.DATASOURCE3)
+            .intervals(querySegmentSpec(Filtration.eternity()))
+            .filters(expressionFilter("array_contains(array(1,null),array((\"d1\" > 1)))"))
+            .columns("dim3")
+            .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
+            .limit(5)
+            .context(QUERY_CONTEXT_DEFAULT);
+
+    testQuery(
+            PLANNER_CONFIG_DEFAULT,
+            QUERY_CONTEXT_DEFAULT,
+            ImmutableList.of(
+                    new SqlParameter(SqlType.ARRAY, Arrays.asList(true, null))
+            ),
+            "SELECT dim3 FROM druid.numfoo WHERE ARRAY_CONTAINS(?, ARRAY[d1>1]) LIMIT 5",
+            CalciteTests.REGULAR_USER_AUTH_RESULT,
+            ImmutableList.of(builder.build()),
+            NullHandling.sqlCompatible() ? ImmutableList.of(
+                    new Object[]{"[\"b\",\"c\"]"},
+                    new Object[]{""},
+                    new Object[]{null},
+                    new Object[]{null}
+            ) : ImmutableList.of(
+                    new Object[]{"[\"b\",\"c\"]"}
+            )
+    );
+  }
+
+  @Test
+  public void testScalarInArrayFilter()
+  {
+    testQuery(
+        "SELECT dim2 FROM druid.numfoo\n"
+        + "WHERE\n"
+        + "  SCALAR_IN_ARRAY(dim2, ARRAY['a', 'd'])\n"
+        + "  OR SCALAR_IN_ARRAY(SUBSTRING(dim1, 1, 1), ARRAY[NULL, 'foo', 'bar'])\n"
+        + "  OR SCALAR_IN_ARRAY(cnt * 2, ARRAY[3])\n",
+        ImmutableList.of(
+            newScanQueryBuilder()
+                .dataSource(CalciteTests.DATASOURCE3)
+                .intervals(querySegmentSpec(Filtration.eternity()))
+                .virtualColumns(
+                    VirtualColumns.create(
+                        NullHandling.sqlCompatible()
+                        ? ImmutableList.of(
+                            expressionVirtualColumn("v0", "substring(\"dim1\", 0, 1)", ColumnType.STRING),
+                            expressionVirtualColumn("v1", "(\"cnt\" * 2)", ColumnType.LONG)
+                        )
+                        : ImmutableList.of(
+                            expressionVirtualColumn("v0", "(\"cnt\" * 2)", ColumnType.LONG)
+                        )
+                    )
+                )
+                .filters(
+                    NullHandling.sqlCompatible()
+                    ? or(
+                        in("dim2", Arrays.asList("a", "d")),
+                        in("v0", Arrays.asList(null, "foo", "bar")),
+                        in("v1", ColumnType.LONG, Collections.singletonList(3L))
+                    )
+                    : or(
+                        in("dim2", Arrays.asList("a", "d")),
+                        in("dim1", Arrays.asList(null, "foo", "bar"), new SubstringDimExtractionFn(0, 1)),
+                        in("v0", ColumnType.LONG, Collections.singletonList(3L))
+                    )
+                )
+                .columns("dim2")
+                .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
+                .context(QUERY_CONTEXT_DEFAULT)
+                .build()
+        ),
+        ImmutableList.of(
+            new Object[]{"a"},
+            new Object[]{"a"}
+        )
+    );
+  }
+
+  @Test
+  public void testNotScalarInArrayFilter()
+  {
+    testQuery(
+        "SELECT dim2 FROM druid.numfoo\n"
+        + "WHERE NOT SCALAR_IN_ARRAY(dim2, ARRAY['a', 'd'])\n",
+        ImmutableList.of(
+            newScanQueryBuilder()
+                .dataSource(CalciteTests.DATASOURCE3)
+                .intervals(querySegmentSpec(Filtration.eternity()))
+                .filters(not(in("dim2", Arrays.asList("a", "d"))))
+                .columns("dim2")
+                .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
+                .context(QUERY_CONTEXT_DEFAULT)
+                .build()
+        ),
+        NullHandling.sqlCompatible()
+        ? ImmutableList.of(
+            new Object[]{""},
+            new Object[]{"abc"}
+        )
+        : ImmutableList.of(
+            new Object[]{""},
+            new Object[]{""},
+            new Object[]{"abc"},
+            new Object[]{""}
+        )
+    );
+  }
+
+  @Test
+  public void testArrayScalarInFilter_MVD()
+  {
+    // In the fifth row, dim3 is an empty list. The Scan query in MSQ reads this with makeDimensionSelector, whereas
+    // the Scan query in native reads this makeColumnValueSelector. Behavior of those selectors is inconsistent.
+    // The DimensionSelector returns an empty list; the ColumnValueSelector returns a list containing a single null.
+    final String expectedValueForEmptyMvd =
+        queryFramework().engine().name().equals("msq-task")
+        ? NullHandling.defaultStringValue()
+        : "not abd";
+
+    testBuilder()
+        .sql(
+            "SELECT dim3, (CASE WHEN scalar_in_array(dim3, Array['a', 'b', 'd']) THEN 'abd' ELSE 'not abd' END) " +
+            "FROM druid.numfoo"
+        )
+        .expectedQueries(
+            ImmutableList.of(
+                newScanQueryBuilder()
+                    .dataSource(CalciteTests.DATASOURCE3)
+                    .intervals(querySegmentSpec(Filtration.eternity()))
+                    .virtualColumns(
+                        expressionVirtualColumn(
+                            "v0",
+                            "case_searched(scalar_in_array(\"dim3\",array('a','b','d')),'abd','not abd')",
+                            ColumnType.STRING
+                        )
+                    )
+                    .columns("dim3", "v0")
+                    .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
+                    .context(QUERY_CONTEXT_DEFAULT)
+                    .build()
+            )
+        )
+        .expectedResults(
+            ImmutableList.of(
+                new Object[]{"[\"a\",\"b\"]", "[\"abd\",\"abd\"]"},
+                new Object[]{"[\"b\",\"c\"]", "[\"abd\",\"not abd\"]"},
+                new Object[]{"d", "abd"},
+                new Object[]{"", "not abd"},
+                new Object[]{NullHandling.defaultStringValue(), expectedValueForEmptyMvd},
+                new Object[]{NullHandling.defaultStringValue(), "not abd"}
+            )
+        )
+        .run();
   }
 
   @Test
@@ -1341,7 +1512,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         QUERY_CONTEXT_NO_STRINGIFY_ARRAY,
         ImmutableList.of(
             new Druids.ScanQueryBuilder()
-                .dataSource(DATA_SOURCE_ARRAYS)
+                .dataSource(CalciteTests.ARRAYS_DATASOURCE)
                 .intervals(querySegmentSpec(Filtration.eternity()))
                 .virtualColumns(
                     expressionVirtualColumn("v0", "array_slice(\"arrayString\",1)", ColumnType.STRING_ARRAY),
@@ -1376,7 +1547,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testArrayLength()
   {
-    // Cannot vectorize due to usage of expressions.
+    // Cannot vectorize due to array expressions.
     cannotVectorize();
 
     testQuery(
@@ -1419,14 +1590,14 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testArrayLengthArrayColumn()
   {
-    // Cannot vectorize due to usage of expressions.
+    // Cannot vectorize due to array expressions.
     cannotVectorize();
 
     testQuery(
         "SELECT arrayStringNulls, ARRAY_LENGTH(arrayStringNulls), SUM(cnt) FROM druid.arrays GROUP BY 1, 2 ORDER BY 2 DESC",
         ImmutableList.of(
             GroupByQuery.builder()
-                        .setDataSource(DATA_SOURCE_ARRAYS)
+                        .setDataSource(CalciteTests.ARRAYS_DATASOURCE)
                         .setInterval(querySegmentSpec(Filtration.eternity()))
                         .setGranularity(Granularities.ALL)
                         .setVirtualColumns(expressionVirtualColumn("v0", "array_length(\"arrayStringNulls\")", ColumnType.LONG))
@@ -1477,7 +1648,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testArrayAppend()
   {
-    // Cannot vectorize due to usage of expressions.
+    // Cannot vectorize due to array expressions.
     cannotVectorize();
 
     ImmutableList<Object[]> results;
@@ -1534,7 +1705,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testArrayPrepend()
   {
-    // Cannot vectorize due to usage of expressions.
+    // Cannot vectorize due to array expressions.
     cannotVectorize();
 
     ImmutableList<Object[]> results;
@@ -1591,7 +1762,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testArrayPrependAppend()
   {
-    // Cannot vectorize due to usage of expressions.
+    // Cannot vectorize due to array expressions.
     cannotVectorize();
 
     ImmutableList<Object[]> results;
@@ -1655,7 +1826,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testArrayConcat()
   {
-    // Cannot vectorize due to usage of expressions.
+    // Cannot vectorize due to array expressions.
     cannotVectorize();
 
     ImmutableList<Object[]> results;
@@ -1712,7 +1883,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testArrayOffset()
   {
-    // Cannot vectorize due to usage of expressions.
+    // Cannot vectorize due to array expressions.
     cannotVectorize();
 
     testQuery(
@@ -1806,7 +1977,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         QUERY_CONTEXT_NO_STRINGIFY_ARRAY,
         ImmutableList.of(
             GroupByQuery.builder()
-                        .setDataSource(DATA_SOURCE_ARRAYS)
+                        .setDataSource(CalciteTests.ARRAYS_DATASOURCE)
                         .setInterval(querySegmentSpec(Filtration.eternity()))
                         .setGranularity(Granularities.ALL)
                         .setDimensions(
@@ -1903,7 +2074,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         QUERY_CONTEXT_NO_STRINGIFY_ARRAY,
         ImmutableList.of(
             GroupByQuery.builder()
-                        .setDataSource(DATA_SOURCE_ARRAYS)
+                        .setDataSource(CalciteTests.ARRAYS_DATASOURCE)
                         .setInterval(querySegmentSpec(Filtration.eternity()))
                         .setGranularity(Granularities.ALL)
                         .setDimensions(
@@ -1992,7 +2163,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testArrayGroupAsArrayWithFunction()
   {
-    // Cannot vectorize due to usage of expressions.
+    // Cannot vectorize due to array expressions.
     cannotVectorize();
     testQuery(
         "SELECT ARRAY[ARRAY_ORDINAL(dim3, 2)], SUM(cnt) FROM druid.numfoo GROUP BY 1 ORDER BY 2 DESC",
@@ -2036,7 +2207,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testArrayOrdinal()
   {
-    // Cannot vectorize due to usage of expressions.
+    // Cannot vectorize due to array expressions.
     cannotVectorize();
 
     testQuery(
@@ -2079,7 +2250,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testArrayOffsetOf()
   {
-    // Cannot vectorize due to usage of expressions.
+    // Cannot vectorize due to array expressions.
     cannotVectorize();
 
     testQuery(
@@ -2128,7 +2299,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testArrayOrdinalOf()
   {
-    // Cannot vectorize due to usage of expressions.
+    // Cannot vectorize due to array expressions.
     cannotVectorize();
 
     testQuery(
@@ -2178,7 +2349,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testArrayToString()
   {
-    // Cannot vectorize due to usage of expressions.
+    // Cannot vectorize due to array expressions.
     cannotVectorize();
 
     ImmutableList<Object[]> results;
@@ -2234,7 +2405,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testArrayToStringToMultiValueString()
   {
-    // Cannot vectorize due to usage of expressions.
+    // Cannot vectorize due to array expressions.
     cannotVectorize();
 
     ImmutableList<Object[]> results;
@@ -2947,7 +3118,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         "SELECT ARRAY_AGG(arrayLongNulls), ARRAY_AGG(DISTINCT arrayDouble), ARRAY_AGG(DISTINCT arrayStringNulls) FILTER(WHERE arrayLong = ARRAY[2,3]) FROM arrays WHERE arrayDoubleNulls is not null",
         ImmutableList.of(
             Druids.newTimeseriesQueryBuilder()
-                  .dataSource(DATA_SOURCE_ARRAYS)
+                  .dataSource(CalciteTests.ARRAYS_DATASOURCE)
                   .intervals(querySegmentSpec(Filtration.eternity()))
                   .granularity(Granularities.ALL)
                   .filters(notNull("arrayDoubleNulls"))
@@ -3031,7 +3202,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         "SELECT ARRAY_CONCAT_AGG(arrayLongNulls), ARRAY_CONCAT_AGG(DISTINCT arrayDouble), ARRAY_CONCAT_AGG(DISTINCT arrayStringNulls) FILTER(WHERE arrayLong = ARRAY[2,3]) FROM arrays WHERE arrayDoubleNulls is not null",
         ImmutableList.of(
             Druids.newTimeseriesQueryBuilder()
-                  .dataSource(DATA_SOURCE_ARRAYS)
+                  .dataSource(CalciteTests.ARRAYS_DATASOURCE)
                   .intervals(querySegmentSpec(Filtration.eternity()))
                   .granularity(Granularities.ALL)
                   .filters(notNull("arrayDoubleNulls"))
@@ -3333,8 +3504,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testArrayAggGroupByArrayAggFromSubquery()
   {
-    cannotVectorize();
-
     testQuery(
         "SELECT dim2, arr, COUNT(*) FROM (SELECT dim2, ARRAY_AGG(DISTINCT dim1) as arr FROM foo WHERE dim1 is not null GROUP BY 1 LIMIT 5) GROUP BY 1,2",
         QUERY_CONTEXT_NO_STRINGIFY_ARRAY,
@@ -3389,10 +3558,10 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
     );
   }
 
+  @SqlTestFrameworkConfig.NumMergeBuffers(3)
   @Test
   public void testArrayAggGroupByArrayAggOfLongsFromSubquery()
   {
-    requireMergeBuffers(3);
     cannotVectorize();
     testQuery(
         "select cntarray, count(*) from ( select dim1, dim2, ARRAY_AGG(cnt) as cntarray from ( select dim1, dim2, dim3, count(*) as cnt from foo group by 1, 2, 3 ) group by 1, 2 ) group by 1",
@@ -3462,10 +3631,10 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
     );
   }
 
+  @SqlTestFrameworkConfig.NumMergeBuffers(3)
   @Test
   public void testArrayAggGroupByArrayAggOfStringsFromSubquery()
   {
-    requireMergeBuffers(3);
     cannotVectorize();
     testQuery(
         "select cntarray, count(*) from ( select dim1, dim2, ARRAY_AGG(cnt) as cntarray from ( select dim1, dim2, dim3, cast( count(*) as VARCHAR ) as cnt from foo group by 1, 2, 3 ) group by 1, 2 ) group by 1",
@@ -3528,10 +3697,10 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
     );
   }
 
+  @SqlTestFrameworkConfig.NumMergeBuffers(3)
   @Test
   public void testArrayAggGroupByArrayAggOfDoubleFromSubquery()
   {
-    requireMergeBuffers(3);
     cannotVectorize();
     testQuery(
         "select cntarray, count(*) from ( select dim1, dim2, ARRAY_AGG(cnt) as cntarray from ( select dim1, dim2, dim3, cast( count(*) as DOUBLE ) as cnt from foo group by 1, 2, 3 ) group by 1, 2 ) group by 1",
@@ -3764,8 +3933,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestInline()
   {
-    skipVectorize();
-    cannotVectorize();
     testQuery(
         "SELECT * FROM UNNEST(ARRAY[1,2,3])",
         QUERY_CONTEXT_UNNEST,
@@ -3801,7 +3968,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestInlineWithCount()
   {
-    skipVectorize();
     cannotVectorize();
     testQuery(
         "SELECT COUNT(*) FROM (select c from UNNEST(ARRAY[1,2,3]) as unnested(c))",
@@ -3832,12 +3998,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnest()
   {
-    // This tells the test to skip generating (vectorize = force) path
-    // Generates only 1 native query with vectorize = false
-    skipVectorize();
-    // This tells that both vectorize = force and vectorize = false takes the same path of non vectorization
-    // Generates 2 native queries with 2 different values of vectorize
-    cannotVectorize();
     testQuery(
         "SELECT d3 FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3)",
         QUERY_CONTEXT_UNNEST,
@@ -3882,14 +4042,13 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestArrayColumnsString()
   {
-    cannotVectorize();
     testQuery(
         "SELECT a FROM druid.arrays, UNNEST(arrayString) as unnested (a)",
         QUERY_CONTEXT_UNNEST,
         ImmutableList.of(
             Druids.newScanQueryBuilder()
                   .dataSource(UnnestDataSource.create(
-                      new TableDataSource(DATA_SOURCE_ARRAYS),
+                      new TableDataSource(CalciteTests.ARRAYS_DATASOURCE),
                       expressionVirtualColumn("j0.unnest", "\"arrayString\"", ColumnType.STRING_ARRAY),
                       null
                   ))
@@ -3928,16 +4087,62 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   }
 
   @Test
+  public void testUnnestArrayColumnsStringThenFunction()
+  {
+    // Regresson test for https://github.com/apache/druid/issues/16543.
+    testQuery(
+        "SELECT a || '.txt' FROM druid.arrays, UNNEST(arrayString) as unnested (a)",
+        QUERY_CONTEXT_UNNEST,
+        ImmutableList.of(
+            newScanQueryBuilder()
+                  .dataSource(UnnestDataSource.create(
+                      new TableDataSource(CalciteTests.ARRAYS_DATASOURCE),
+                      expressionVirtualColumn("j0.unnest", "\"arrayString\"", ColumnType.STRING_ARRAY),
+                      null
+                  ))
+                  .intervals(querySegmentSpec(Filtration.eternity()))
+                  .virtualColumns(expressionVirtualColumn("v0", "concat(\"j0.unnest\",'.txt')", ColumnType.STRING))
+                  .context(QUERY_CONTEXT_UNNEST)
+                  .columns(ImmutableList.of("v0"))
+                  .build()
+        ),
+        ImmutableList.of(
+            new Object[]{"d.txt"},
+            new Object[]{"e.txt"},
+            new Object[]{"a.txt"},
+            new Object[]{"b.txt"},
+            new Object[]{"a.txt"},
+            new Object[]{"b.txt"},
+            new Object[]{"b.txt"},
+            new Object[]{"c.txt"},
+            new Object[]{"a.txt"},
+            new Object[]{"b.txt"},
+            new Object[]{"c.txt"},
+            new Object[]{"d.txt"},
+            new Object[]{"e.txt"},
+            new Object[]{"a.txt"},
+            new Object[]{"b.txt"},
+            new Object[]{"a.txt"},
+            new Object[]{"b.txt"},
+            new Object[]{"b.txt"},
+            new Object[]{"c.txt"},
+            new Object[]{"a.txt"},
+            new Object[]{"b.txt"},
+            new Object[]{"c.txt"}
+        )
+    );
+  }
+
+  @Test
   public void testUnnestArrayColumnsStringNulls()
   {
-    cannotVectorize();
     testQuery(
         "SELECT a FROM druid.arrays, UNNEST(arrayStringNulls) as unnested (a)",
         QUERY_CONTEXT_UNNEST,
         ImmutableList.of(
             Druids.newScanQueryBuilder()
                   .dataSource(UnnestDataSource.create(
-                      new TableDataSource(DATA_SOURCE_ARRAYS),
+                      new TableDataSource(CalciteTests.ARRAYS_DATASOURCE),
                       expressionVirtualColumn("j0.unnest", "\"arrayStringNulls\"", ColumnType.STRING_ARRAY),
                       null
                   ))
@@ -3977,14 +4182,13 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestArrayColumnsLong()
   {
-    cannotVectorize();
     testQuery(
         "SELECT a FROM druid.arrays, UNNEST(arrayLong) as unnested (a)",
         QUERY_CONTEXT_UNNEST,
         ImmutableList.of(
             Druids.newScanQueryBuilder()
                   .dataSource(UnnestDataSource.create(
-                      new TableDataSource(DATA_SOURCE_ARRAYS),
+                      new TableDataSource(CalciteTests.ARRAYS_DATASOURCE),
                       expressionVirtualColumn("j0.unnest", "\"arrayLong\"", ColumnType.LONG_ARRAY),
                       null
                   ))
@@ -4031,14 +4235,13 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestArrayColumnsLongNulls()
   {
-    cannotVectorize();
     testQuery(
         "SELECT a FROM druid.arrays, UNNEST(arrayLongNulls) as unnested (a)",
         QUERY_CONTEXT_UNNEST,
         ImmutableList.of(
             Druids.newScanQueryBuilder()
                   .dataSource(UnnestDataSource.create(
-                      new TableDataSource(DATA_SOURCE_ARRAYS),
+                      new TableDataSource(CalciteTests.ARRAYS_DATASOURCE),
                       expressionVirtualColumn("j0.unnest", "\"arrayLongNulls\"", ColumnType.LONG_ARRAY),
                       null
                   ))
@@ -4081,14 +4284,13 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestArrayColumnsDouble()
   {
-    cannotVectorize();
     testQuery(
         "SELECT a FROM druid.arrays, UNNEST(arrayDouble) as unnested (a)",
         QUERY_CONTEXT_UNNEST,
         ImmutableList.of(
             Druids.newScanQueryBuilder()
                   .dataSource(UnnestDataSource.create(
-                      new TableDataSource(DATA_SOURCE_ARRAYS),
+                      new TableDataSource(CalciteTests.ARRAYS_DATASOURCE),
                       expressionVirtualColumn("j0.unnest", "\"arrayDouble\"", ColumnType.DOUBLE_ARRAY),
                       null
                   ))
@@ -4135,14 +4337,13 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestArrayColumnsDoubleNulls()
   {
-    cannotVectorize();
     testQuery(
         "SELECT a FROM druid.arrays, UNNEST(arrayDoubleNulls) as unnested (a)",
         QUERY_CONTEXT_UNNEST,
         ImmutableList.of(
             Druids.newScanQueryBuilder()
                   .dataSource(UnnestDataSource.create(
-                      new TableDataSource(DATA_SOURCE_ARRAYS),
+                      new TableDataSource(CalciteTests.ARRAYS_DATASOURCE),
                       expressionVirtualColumn("j0.unnest", "\"arrayDoubleNulls\"", ColumnType.DOUBLE_ARRAY),
                       null
                   ))
@@ -4188,7 +4389,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestTwice()
   {
-    cannotVectorize();
     testQuery(
         "SELECT dim1, MV_TO_ARRAY(dim3), STRING_TO_ARRAY(dim1, U&'\\005C.') AS dim1_split, dim1_split_unnest, dim3_unnest\n"
         + "FROM\n"
@@ -4265,7 +4465,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestTwiceArrayColumns()
   {
-    cannotVectorize();
     testQuery(
         "SELECT arrayStringNulls, arrayLongNulls, usn, uln"
         + "  FROM\n"
@@ -4278,7 +4477,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
                   .dataSource(
                       UnnestDataSource.create(
                           UnnestDataSource.create(
-                              new TableDataSource(DATA_SOURCE_ARRAYS),
+                              new TableDataSource(CalciteTests.ARRAYS_DATASOURCE),
                               expressionVirtualColumn(
                                   "j0.unnest",
                                   "\"arrayStringNulls\"",
@@ -4348,7 +4547,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestTwiceWithFiltersAndExpressions()
   {
-    cannotVectorize();
     testQuery(
         "SELECT dim1, MV_TO_ARRAY(dim3), STRING_TO_ARRAY(dim1, U&'\\005C.') AS dim1_split, dim1_split_unnest, dim3_unnest || 'xx'\n"
         + "FROM\n"
@@ -4368,7 +4566,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
                                   "string_to_array(\"dim1\",'\\u005C.')",
                                   ColumnType.STRING_ARRAY
                               ),
-                              in("j0.unnest", ImmutableList.of("1", "2"), null)
+                              in("j0.unnest", ImmutableList.of("1", "2"))
                           ),
                           expressionVirtualColumn(
                               "_j0.unnest",
@@ -4414,7 +4612,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestThriceWithFiltersOnDimAndUnnestCol()
   {
-    cannotVectorize();
     String sql = "    SELECT dimZipf, dim3_unnest1, dim3_unnest2, dim3_unnest3 FROM \n"
                  + "      ( SELECT * FROM \n"
                  + "           ( SELECT * FROM lotsocolumns, UNNEST(MV_TO_ARRAY(dimMultivalEnumerated)) as ut(dim3_unnest1) )"
@@ -4512,7 +4709,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestThriceWithFiltersOnDimAndAllUnnestColumns()
   {
-    cannotVectorize();
     String sql = "    SELECT dimZipf, dim3_unnest1, dim3_unnest2, dim3_unnest3 FROM \n"
                  + "      ( SELECT * FROM \n"
                  + "           ( SELECT * FROM lotsocolumns, UNNEST(MV_TO_ARRAY(dimMultivalEnumerated)) as ut(dim3_unnest1) )"
@@ -4581,7 +4777,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestThriceWithFiltersOnDimAndAllUnnestColumnsArrayColumns()
   {
-    cannotVectorize();
     String sql = "    SELECT arrayString, uln, udn, usn FROM \n"
                  + "      ( SELECT * FROM \n"
                  + "           ( SELECT * FROM arrays, UNNEST(arrayLongNulls) as ut(uln))"
@@ -4595,7 +4790,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
                       UnnestDataSource.create(
                           FilteredDataSource.create(
                               UnnestDataSource.create(
-                                  new TableDataSource(DATA_SOURCE_ARRAYS),
+                                  new TableDataSource(CalciteTests.ARRAYS_DATASOURCE),
                                   expressionVirtualColumn(
                                       "j0.unnest",
                                       "\"arrayLongNulls\"",
@@ -4649,8 +4844,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestThriceWithFiltersOnDimAndUnnestColumnsORCombinations()
   {
-    cannotVectorize();
-    skipVectorize();
     String sql = "    SELECT dimZipf, dim3_unnest1, dim3_unnest2, dim3_unnest3 FROM \n"
                  + "      ( SELECT * FROM \n"
                  + "           ( SELECT * FROM lotsocolumns, UNNEST(MV_TO_ARRAY(dimMultivalEnumerated)) as ut(dim3_unnest1) )"
@@ -4730,7 +4923,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestThriceWithFiltersOnDimAndAllUnnestColumnsArrayColumnsOrFilters()
   {
-    cannotVectorize();
     String sql = "    SELECT arrayString, uln, udn, usn FROM \n"
                  + "      ( SELECT * FROM \n"
                  + "           ( SELECT * FROM arrays, UNNEST(arrayLongNulls) as ut(uln))"
@@ -4745,7 +4937,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
                         UnnestDataSource.create(
                             FilteredDataSource.create(
                                 UnnestDataSource.create(
-                                    new TableDataSource(DATA_SOURCE_ARRAYS),
+                                    new TableDataSource(CalciteTests.ARRAYS_DATASOURCE),
                                     expressionVirtualColumn(
                                         "j0.unnest",
                                         "\"arrayLongNulls\"",
@@ -4804,11 +4996,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithGroupBy()
   {
-    // This tells the test to skip generating (vectorize = force) path
-    // Generates only 1 native query with vectorize = false
-    skipVectorize();
-    // This tells that both vectorize = force and vectorize = false takes the same path of non vectorization
-    // Generates 2 native queries with 2 different values of vectorize
     cannotVectorize();
     testQuery(
         "SELECT d3 FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3) GROUP BY d3 ",
@@ -4856,7 +5043,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         ImmutableList.of(
             GroupByQuery.builder()
                         .setDataSource(UnnestDataSource.create(
-                            new TableDataSource(DATA_SOURCE_ARRAYS),
+                            new TableDataSource(CalciteTests.ARRAYS_DATASOURCE),
                             expressionVirtualColumn("j0.unnest", "\"arrayStringNulls\"", ColumnType.STRING_ARRAY),
                             null
                         ))
@@ -4879,11 +5066,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithGroupByOrderBy()
   {
-    // This tells the test to skip generating (vectorize = force) path
-    // Generates only 1 native query with vectorize = false
-    skipVectorize();
-    // This tells that both vectorize = force and vectorize = false takes the same path of non vectorization
-    // Generates 2 native queries with 2 different values of vectorize
     cannotVectorize();
     testQuery(
         "SELECT d3, COUNT(*) FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) AS unnested(d3) GROUP BY d3 ORDER BY d3 DESC ",
@@ -4935,12 +5117,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithGroupByOrderByWithLimit()
   {
-    // This tells the test to skip generating (vectorize = force) path
-    // Generates only 1 native query with vectorize = false
-    skipVectorize();
-    // This tells that both vectorize = force and vectorize = false takes the same path of non vectorization
-    // Generates 2 native queries with 2 different values of vectorize
-    cannotVectorize();
     testQuery(
         "SELECT d3, COUNT(*) FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) AS unnested(d3) GROUP BY d3 ORDER BY d3 ASC LIMIT 4 ",
         QUERY_CONTEXT_UNNEST,
@@ -4978,7 +5154,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithGroupByHaving()
   {
-    skipVectorize();
     cannotVectorize();
     testQuery(
         "SELECT d3, COUNT(*) FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) AS unnested(d3) GROUP BY d3 HAVING COUNT(*) = 1",
@@ -5017,12 +5192,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithLimit()
   {
-    // This tells the test to skip generating (vectorize = force) path
-    // Generates only 1 native query with vectorize = false
-    skipVectorize();
-    // This tells that both vectorize = force and vectorize = false takes the same path of non vectorization
-    // Generates 2 native queries with 2 different values of vectorize
-    cannotVectorize();
     testQuery(
         "SELECT d3 FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3) LIMIT 3",
         QUERY_CONTEXT_UNNEST,
@@ -5052,12 +5221,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestFirstQueryOnSelect()
   {
-    // This tells the test to skip generating (vectorize = force) path
-    // Generates only 1 native query with vectorize = false
-    skipVectorize();
-    // This tells that both vectorize = force and vectorize = false takes the same path of non vectorization
-    // Generates 2 native queries with 2 different values of vectorize
-    cannotVectorize();
     testQuery(
         "SELECT d3 FROM (select dim1, dim2, dim3 from druid.numfoo), UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3)",
         QUERY_CONTEXT_UNNEST,
@@ -5102,12 +5265,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestVirtualWithColumns1()
   {
-    // This tells the test to skip generating (vectorize = force) path
-    // Generates only 1 native query with vectorize = false
-    skipVectorize();
-    // This tells that both vectorize = force and vectorize = false takes the same path of non vectorization
-    // Generates 2 native queries with 2 different values of vectorize
-    cannotVectorize();
     testQuery(
         "SELECT strings, m1 FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) as unnested (strings) where (strings='a' and (m1<=10 or strings='b'))",
         QUERY_CONTEXT_UNNEST,
@@ -5148,12 +5305,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestVirtualWithColumns2()
   {
-    // This tells the test to skip generating (vectorize = force) path
-    // Generates only 1 native query with vectorize = false
-    skipVectorize();
-    // This tells that both vectorize = force and vectorize = false takes the same path of non vectorization
-    // Generates 2 native queries with 2 different values of vectorize
-    cannotVectorize();
     testQuery(
         "SELECT strings, m1 FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) as unnested (strings) where (strings='a' or (m1=2 and strings='b'))",
         QUERY_CONTEXT_UNNEST,
@@ -5191,12 +5342,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithFilters()
   {
-    // This tells the test to skip generating (vectorize = force) path
-    // Generates only 1 native query with vectorize = false
-    skipVectorize();
-    // This tells that both vectorize = force and vectorize = false takes the same path of non vectorization
-    // Generates 2 native queries with 2 different values of vectorize
-    cannotVectorize();
     testQuery(
         "SELECT d3 FROM (select * from druid.numfoo where dim2='a'), UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3)",
         QUERY_CONTEXT_UNNEST,
@@ -5228,12 +5373,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithFiltersWithExpressionInInnerQuery()
   {
-    // This tells the test to skip generating (vectorize = force) path
-    // Generates only 1 native query with vectorize = false
-    skipVectorize();
-    // This tells that both vectorize = force and vectorize = false takes the same path of non vectorization
-    // Generates 2 native queries with 2 different values of vectorize
-    cannotVectorize();
     testQuery(
         "SELECT t,d3 FROM (select FLOOR(__time to hour) t, dim3 from druid.numfoo where dim2='a'), UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3)",
         QUERY_CONTEXT_UNNEST,
@@ -5270,12 +5409,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithInFiltersWithExpressionInInnerQuery()
   {
-    // This tells the test to skip generating (vectorize = force) path
-    // Generates only 1 native query with vectorize = false
-    skipVectorize();
-    // This tells that both vectorize = force and vectorize = false takes the same path of non vectorization
-    // Generates 2 native queries with 2 different values of vectorize
-    cannotVectorize();
     testQuery(
         "SELECT t,d3 FROM (select FLOOR(__time to hour) t, dim3 from druid.numfoo where dim2 IN ('a','b')), UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3)",
         QUERY_CONTEXT_UNNEST,
@@ -5284,7 +5417,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
                   .dataSource(UnnestDataSource.create(
                       FilteredDataSource.create(
                           new TableDataSource(CalciteTests.DATASOURCE3),
-                          new InDimFilter("dim2", ImmutableList.of("a", "b"), null)
+                          in("dim2", ImmutableList.of("a", "b"))
                       ),
                       expressionVirtualColumn("j0.unnest", "\"dim3\"", ColumnType.STRING),
                       null
@@ -5310,12 +5443,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithFiltersInnerLimit()
   {
-    // This tells the test to skip generating (vectorize = force) path
-    // Generates only 1 native query with vectorize = false
-    skipVectorize();
-    // This tells that both vectorize = force and vectorize = false takes the same path of non vectorization
-    // Generates 2 native queries with 2 different values of vectorize
-    cannotVectorize();
     testQuery(
         "SELECT d3 FROM (select dim2,dim3 from druid.numfoo where dim2='a' LIMIT 2), UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3)",
         QUERY_CONTEXT_UNNEST,
@@ -5362,7 +5489,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithFiltersInsideAndOutside()
   {
-    skipVectorize();
     testQuery(
         "SELECT d3 FROM\n"
         + "  (select * from druid.numfoo where dim2='a') as t,\n"
@@ -5400,7 +5526,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithFiltersInsideAndOutside1()
   {
-    skipVectorize();
     testQuery(
         "SELECT d3 FROM\n"
         + "  (select * from druid.numfoo where dim2='a'),\n"
@@ -5420,8 +5545,8 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
                       ),
                       expressionVirtualColumn("j0.unnest", "\"dim3\"", ColumnType.STRING),
                       or(
-                          new LikeDimFilter("j0.unnest", "_", null, null),
-                          in("j0.unnest", ImmutableList.of("a", "c"), null)
+                          in("j0.unnest", ImmutableList.of("a", "c")),
+                          new LikeDimFilter("j0.unnest", "_", null, null)
                       )
                   ))
                   .intervals(querySegmentSpec(Filtration.eternity()))
@@ -5441,7 +5566,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithFiltersOutside()
   {
-    skipVectorize();
     testQuery(
         "SELECT d3 FROM\n"
         + "  druid.numfoo t,\n"
@@ -5462,8 +5586,8 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
                       ),
                       expressionVirtualColumn("j0.unnest", "\"dim3\"", ColumnType.STRING),
                       or(
-                          new LikeDimFilter("j0.unnest", "_", null, null),
-                          in("j0.unnest", ImmutableList.of("a", "c"), null)
+                          in("j0.unnest", ImmutableList.of("a", "c")),
+                          new LikeDimFilter("j0.unnest", "_", null, null)
                       )
                   ))
                   .intervals(querySegmentSpec(Filtration.eternity()))
@@ -5483,12 +5607,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithInFilters()
   {
-    // This tells the test to skip generating (vectorize = force) path
-    // Generates only 1 native query with vectorize = false
-    skipVectorize();
-    // This tells that both vectorize = force and vectorize = false takes the same path of non vectorization
-    // Generates 2 native queries with 2 different values of vectorize
-    cannotVectorize();
     testQuery(
         "SELECT d3 FROM (select * from druid.numfoo where dim2 IN ('a','b','ab','abc')), UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3)",
         QUERY_CONTEXT_UNNEST,
@@ -5497,7 +5615,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
                   .dataSource(UnnestDataSource.create(
                       FilteredDataSource.create(
                           new TableDataSource(CalciteTests.DATASOURCE3),
-                          new InDimFilter("dim2", ImmutableList.of("a", "b", "ab", "abc"), null)
+                          in("dim2", ImmutableList.of("a", "b", "ab", "abc"))
                       ),
                       expressionVirtualColumn("j0.unnest", "\"dim3\"", ColumnType.STRING),
                       null
@@ -5522,12 +5640,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestVirtualWithColumns()
   {
-    // This tells the test to skip generating (vectorize = force) path
-    // Generates only 1 native query with vectorize = false
-    skipVectorize();
-    // This tells that both vectorize = force and vectorize = false takes the same path of non vectorization
-    // Generates 2 native queries with 2 different values of vectorize
-    cannotVectorize();
     testQuery(
         "SELECT strings FROM druid.numfoo, UNNEST(ARRAY[dim4, dim5]) as unnested (strings)",
         QUERY_CONTEXT_UNNEST,
@@ -5565,7 +5677,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithGroupByOrderByOnVirtualColumn()
   {
-    skipVectorize();
     cannotVectorize();
     testQuery(
         "SELECT d24, COUNT(*) FROM druid.numfoo, UNNEST(ARRAY[dim2, dim4]) AS unnested(d24) GROUP BY d24 ORDER BY d24 DESC ",
@@ -5621,8 +5732,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithJoinOnTheLeft()
   {
-    skipVectorize();
-    cannotVectorize();
     testQuery(
         "SELECT d3 from (SELECT * from druid.numfoo JOIN (select dim2 as t from druid.numfoo where dim2 IN ('a','b','ab','abc')) ON dim2=t), UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3)",
         QUERY_CONTEXT_UNNEST,
@@ -5639,7 +5748,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
                                   .intervals(querySegmentSpec(Filtration.eternity()))
                                   .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
                                   .legacy(false)
-                                  .filters(new InDimFilter("dim2", ImmutableList.of("a", "b", "ab", "abc"), null))
+                                  .filters(in("dim2", ImmutableList.of("a", "b", "ab", "abc")))
                                   .columns("dim2")
                                   .context(QUERY_CONTEXT_UNNEST)
                                   .build()
@@ -5686,8 +5795,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
     // Since there is a constant on the right,
     // Druid will plan this as a join query
     // as there is nothing to correlate between left and right
-    skipVectorize();
-    cannotVectorize();
     testQuery(
         "SELECT longs FROM druid.numfoo, UNNEST(ARRAY[1,2,3]) as unnested (longs)",
         QUERY_CONTEXT_UNNEST,
@@ -5742,8 +5849,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithSQLFunctionOnUnnestedColumn()
   {
-    skipVectorize();
-    cannotVectorize();
     testQuery(
         "SELECT strlen(d3) FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3)",
         QUERY_CONTEXT_UNNEST,
@@ -5789,8 +5894,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithINFiltersWithLeftRewrite()
   {
-    skipVectorize();
-    cannotVectorize();
     testQuery(
         "SELECT d3 FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3) where d3 IN ('a','b') and m1 < 10",
         QUERY_CONTEXT_UNNEST,
@@ -5802,7 +5905,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
                           range("m1", ColumnType.LONG, null, 10L, false, true)
                       ),
                       expressionVirtualColumn("j0.unnest", "\"dim3\"", ColumnType.STRING),
-                      new InDimFilter("j0.unnest", ImmutableSet.of("a", "b"), null)
+                      in("j0.unnest", ImmutableSet.of("a", "b"))
                   ))
                   .intervals(querySegmentSpec(Filtration.eternity()))
                   .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
@@ -5822,8 +5925,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithINFiltersWithNoLeftRewrite()
   {
-    skipVectorize();
-    cannotVectorize();
     testQuery(
         "SELECT d45 FROM druid.numfoo, UNNEST(ARRAY[dim4,dim5]) as unnested (d45) where d45 IN ('a','b')",
         QUERY_CONTEXT_UNNEST,
@@ -5832,7 +5933,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
                   .dataSource(UnnestDataSource.create(
                       new TableDataSource(CalciteTests.DATASOURCE3),
                       expressionVirtualColumn("j0.unnest", "array(\"dim4\",\"dim5\")", ColumnType.STRING_ARRAY),
-                      new InDimFilter("j0.unnest", ImmutableSet.of("a", "b"), null)
+                      in("j0.unnest", ImmutableSet.of("a", "b"))
                   ))
                   .intervals(querySegmentSpec(Filtration.eternity()))
                   .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
@@ -5855,8 +5956,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithInvalidINFiltersOnUnnestedColumn()
   {
-    skipVectorize();
-    cannotVectorize();
     testQuery(
         "SELECT d3 FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3) where d3 IN ('foo','bar')",
         QUERY_CONTEXT_UNNEST,
@@ -5865,7 +5964,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
                   .dataSource(UnnestDataSource.create(
                       new TableDataSource(CalciteTests.DATASOURCE3),
                       expressionVirtualColumn("j0.unnest", "\"dim3\"", ColumnType.STRING),
-                      new InDimFilter("j0.unnest", ImmutableSet.of("foo", "bar"), null)
+                      in("j0.unnest", ImmutableSet.of("foo", "bar"))
                   ))
                   .intervals(querySegmentSpec(Filtration.eternity()))
                   .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
@@ -5881,8 +5980,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithNotFiltersOnUnnestedColumn()
   {
-    skipVectorize();
-    cannotVectorize();
     testQuery(
         "SELECT d3 FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3) where d3!='d' ",
         QUERY_CONTEXT_UNNEST,
@@ -5923,8 +6020,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithSelectorFiltersOnSelectedColumn()
   {
-    skipVectorize();
-    cannotVectorize();
     testQuery(
         "SELECT d3 FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3) where d3='b'",
         QUERY_CONTEXT_UNNEST,
@@ -5952,8 +6047,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithSelectorFiltersOnVirtualColumn()
   {
-    skipVectorize();
-    cannotVectorize();
     testQuery(
         "SELECT d12 FROM druid.numfoo, UNNEST(ARRAY[m1,m2]) as unnested (d12) where d12=1",
         QUERY_CONTEXT_UNNEST,
@@ -5983,8 +6076,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithSelectorFiltersOnVirtualStringColumn()
   {
-    skipVectorize();
-    cannotVectorize();
     testQuery(
         "SELECT d45 FROM druid.numfoo, UNNEST(ARRAY[dim4,dim5]) as unnested (d45) where d45 IN ('a','ab')",
         QUERY_CONTEXT_UNNEST,
@@ -5993,7 +6084,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
                   .dataSource(UnnestDataSource.create(
                       new TableDataSource(CalciteTests.DATASOURCE3),
                       expressionVirtualColumn("j0.unnest", "array(\"dim4\",\"dim5\")", ColumnType.STRING_ARRAY),
-                      new InDimFilter("j0.unnest", ImmutableSet.of("a", "ab"), null)
+                      in("j0.unnest", ImmutableSet.of("a", "ab"))
                   ))
                   .intervals(querySegmentSpec(Filtration.eternity()))
                   .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
@@ -6015,8 +6106,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithMultipleAndFiltersOnSelectedColumns()
   {
-    skipVectorize();
-    cannotVectorize();
     testQuery(
         "SELECT d3 FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3) where d3='b' and m1 < 10 and m2 < 10",
         QUERY_CONTEXT_UNNEST,
@@ -6050,8 +6139,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithMultipleOrFiltersOnSelectedColumns()
   {
-    skipVectorize();
-    cannotVectorize();
     testQuery(
         "SELECT d3 FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3) where d3='b' or m1 < 2 ",
         QUERY_CONTEXT_UNNEST,
@@ -6086,8 +6173,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithMultipleAndFiltersOnSelectedUnnestedColumns()
   {
-    skipVectorize();
-    cannotVectorize();
     testQuery(
         "SELECT d3 FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3) where d3 IN ('a','b') and d3 < 'e' ",
         QUERY_CONTEXT_UNNEST,
@@ -6096,7 +6181,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
                   .dataSource(UnnestDataSource.create(
                       new TableDataSource(CalciteTests.DATASOURCE3),
                       expressionVirtualColumn("j0.unnest", "\"dim3\"", ColumnType.STRING),
-                      new InDimFilter("j0.unnest", ImmutableSet.of("a", "b"), null)
+                      in("j0.unnest", ImmutableSet.of("a", "b"))
                   ))
                   .intervals(querySegmentSpec(Filtration.eternity()))
                   .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
@@ -6116,8 +6201,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithMultipleOrFiltersOnUnnestedColumns()
   {
-    skipVectorize();
-    cannotVectorize();
     testQuery(
         "SELECT d3 FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3) where d3='b' or d3='d' ",
         QUERY_CONTEXT_UNNEST,
@@ -6126,7 +6209,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
                   .dataSource(UnnestDataSource.create(
                       new TableDataSource(CalciteTests.DATASOURCE3),
                       expressionVirtualColumn("j0.unnest", "\"dim3\"", ColumnType.STRING),
-                      new InDimFilter("j0.unnest", ImmutableSet.of("b", "d"), null)
+                      in("j0.unnest", ImmutableSet.of("b", "d"))
                   ))
                   .intervals(querySegmentSpec(Filtration.eternity()))
                   .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
@@ -6146,8 +6229,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithMultipleOrFiltersOnVariationsOfUnnestedColumns()
   {
-    skipVectorize();
-    cannotVectorize();
     testQuery(
         "SELECT d3 FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3) where strlen(d3) < 2 or d3='d' ",
         QUERY_CONTEXT_UNNEST,
@@ -6193,8 +6274,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithMultipleOrFiltersOnSelectedNonUnnestedColumns()
   {
-    skipVectorize();
-    cannotVectorize();
     testQuery(
         "SELECT d3 FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3) where m1 < 2 or m2 < 2 ",
         QUERY_CONTEXT_UNNEST,
@@ -6228,8 +6307,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithMultipleOrFiltersOnSelectedVirtualColumns()
   {
-    skipVectorize();
-    cannotVectorize();
     testQuery(
         "SELECT d45 FROM druid.numfoo, UNNEST(ARRAY[dim4,dim5]) as unnested (d45) where d45 IN ('a','aa') or m1 < 2 ",
         QUERY_CONTEXT_UNNEST,
@@ -6246,8 +6323,8 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
                   .context(QUERY_CONTEXT_UNNEST)
                   .filters(
                       or(
-                          range("m1", ColumnType.LONG, null, 2L, false, true),
-                          new InDimFilter("j0.unnest", ImmutableSet.of("a", "aa"), null)
+                          in("j0.unnest", ImmutableSet.of("a", "aa")),
+                          range("m1", ColumnType.LONG, null, 2L, false, true)
                       )
                   )
                   .columns(ImmutableList.of("j0.unnest"))
@@ -6266,8 +6343,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithMultipleOrFiltersOnUnnestedColumnsAndOnOriginalColumn()
   {
-    skipVectorize();
-    cannotVectorize();
     testQuery(
         "SELECT d3 FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3) where d3='b' or dim3='d' ",
         QUERY_CONTEXT_UNNEST,
@@ -6302,8 +6377,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithMultipleOrFiltersOnUnnestedColumnsAndOnOriginalColumnDiffOrdering()
   {
-    skipVectorize();
-    cannotVectorize();
     testQuery(
         "SELECT dim3, d3 FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3) where dim3='b' or d3='a' ",
         QUERY_CONTEXT_UNNEST,
@@ -6339,7 +6412,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithCountOnColumn()
   {
-    skipVectorize();
     cannotVectorize();
     testQuery(
         "SELECT count(*) d3 FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3)",
@@ -6365,7 +6437,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithGroupByHavingSelector()
   {
-    skipVectorize();
     cannotVectorize();
     testQuery(
         "SELECT d3, COUNT(*) FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) AS unnested(d3) GROUP BY d3 HAVING d3='b'",
@@ -6395,7 +6466,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithSumOnUnnestedVirtualColumn()
   {
-    skipVectorize();
     cannotVectorize();
     testQuery(
         "select sum(c) col from druid.numfoo, unnest(ARRAY[m1,m2]) as u(c)",
@@ -6421,7 +6491,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithSumOnUnnestedColumn()
   {
-    skipVectorize();
     cannotVectorize();
     testQuery(
         "select sum(c) col from druid.numfoo, unnest(mv_to_array(dim3)) as u(c)",
@@ -6452,7 +6521,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithSumOnUnnestedArrayColumn()
   {
-    skipVectorize();
     cannotVectorize();
     testQuery(
         "select sum(c) col from druid.arrays, unnest(arrayDoubleNulls) as u(c)",
@@ -6460,7 +6528,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         ImmutableList.of(
             Druids.newTimeseriesQueryBuilder()
                   .dataSource(UnnestDataSource.create(
-                      new TableDataSource(DATA_SOURCE_ARRAYS),
+                      new TableDataSource(CalciteTests.ARRAYS_DATASOURCE),
                       expressionVirtualColumn("j0.unnest", "\"arrayDoubleNulls\"", ColumnType.DOUBLE_ARRAY),
                       null
                   ))
@@ -6478,7 +6546,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithGroupByHavingWithWhereOnAggCol()
   {
-    skipVectorize();
     cannotVectorize();
     testQuery(
         "SELECT d3, COUNT(*) FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) AS unnested(d3) WHERE d3 IN ('a','c') GROUP BY d3 HAVING COUNT(*) = 1",
@@ -6488,7 +6555,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
                         .setDataSource(UnnestDataSource.create(
                             new TableDataSource(CalciteTests.DATASOURCE3),
                             expressionVirtualColumn("j0.unnest", "\"dim3\"", ColumnType.STRING),
-                            new InDimFilter("j0.unnest", ImmutableSet.of("a", "c"), null)
+                            in("j0.unnest", ImmutableSet.of("a", "c"))
                         ))
                         .setInterval(querySegmentSpec(Filtration.eternity()))
                         .setContext(QUERY_CONTEXT_UNNEST)
@@ -6509,7 +6576,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithGroupByHavingWithWhereOnUnnestCol()
   {
-    skipVectorize();
     cannotVectorize();
     testQuery(
         "SELECT d3, COUNT(*) FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) AS unnested(d3) WHERE d3 IN ('a','c') GROUP BY d3 HAVING d3='a'",
@@ -6519,7 +6585,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
                         .setDataSource(UnnestDataSource.create(
                             new TableDataSource(CalciteTests.DATASOURCE3),
                             expressionVirtualColumn("j0.unnest", "\"dim3\"", ColumnType.STRING),
-                            new InDimFilter("j0.unnest", ImmutableSet.of("a", "c"), null)
+                            in("j0.unnest", ImmutableSet.of("a", "c"))
                         ))
                         .setInterval(querySegmentSpec(Filtration.eternity()))
                         .setContext(QUERY_CONTEXT_UNNEST)
@@ -6539,7 +6605,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithGroupByWithWhereOnUnnestArrayCol()
   {
-    skipVectorize();
     cannotVectorize();
     testQuery(
         "SELECT uln, COUNT(*) FROM druid.arrays, UNNEST(arrayLongNulls) AS unnested(uln) WHERE uln IN (1, 2, 3) GROUP BY uln",
@@ -6547,15 +6612,9 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         ImmutableList.of(
             GroupByQuery.builder()
                         .setDataSource(UnnestDataSource.create(
-                            new TableDataSource(DATA_SOURCE_ARRAYS),
+                            new TableDataSource(CalciteTests.ARRAYS_DATASOURCE),
                             expressionVirtualColumn("j0.unnest", "\"arrayLongNulls\"", ColumnType.LONG_ARRAY),
-                            NullHandling.sqlCompatible()
-                            ? or(
-                                equality("j0.unnest", 1L, ColumnType.LONG),
-                                equality("j0.unnest", 2L, ColumnType.LONG),
-                                equality("j0.unnest", 3L, ColumnType.LONG)
-                            )
-                            : in("j0.unnest", ImmutableList.of("1", "2", "3"), null)
+                            in("j0.unnest", ColumnType.LONG, ImmutableList.of(1L, 2L, 3L))
                         ))
                         .setInterval(querySegmentSpec(Filtration.eternity()))
                         .setContext(QUERY_CONTEXT_UNNEST)
@@ -6576,7 +6635,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestWithGroupByHavingWithWhereOnUnnestArrayCol()
   {
-    skipVectorize();
     cannotVectorize();
     testQuery(
         "SELECT uln, COUNT(*) FROM druid.arrays, UNNEST(arrayLongNulls) AS unnested(uln) WHERE uln IN (1, 2, 3) GROUP BY uln HAVING uln=1",
@@ -6584,15 +6642,9 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         ImmutableList.of(
             GroupByQuery.builder()
                         .setDataSource(UnnestDataSource.create(
-                            new TableDataSource(DATA_SOURCE_ARRAYS),
+                            new TableDataSource(CalciteTests.ARRAYS_DATASOURCE),
                             expressionVirtualColumn("j0.unnest", "\"arrayLongNulls\"", ColumnType.LONG_ARRAY),
-                            NullHandling.sqlCompatible()
-                            ? or(
-                                equality("j0.unnest", 1L, ColumnType.LONG),
-                                equality("j0.unnest", 2L, ColumnType.LONG),
-                                equality("j0.unnest", 3L, ColumnType.LONG)
-                            )
-                            : in("j0.unnest", ImmutableList.of("1", "2", "3"), null)
+                            in("j0.unnest", ColumnType.LONG, ImmutableList.of(1L, 2L, 3L))
                         ))
                         .setInterval(querySegmentSpec(Filtration.eternity()))
                         .setContext(QUERY_CONTEXT_UNNEST)
@@ -6612,8 +6664,6 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
   @Test
   public void testUnnestVirtualWithColumnsAndNullIf()
   {
-    skipVectorize();
-    cannotVectorize();
     testQuery(
         "select c,m2 from druid.foo, unnest(ARRAY[\"m1\", \"m2\"]) as u(c) where NULLIF(c,m2) IS NULL",
         QUERY_CONTEXT_UNNEST,
@@ -6702,7 +6752,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
             Druids.newScanQueryBuilder()
                   .dataSource(UnnestDataSource.create(
                       FilteredDataSource.create(
-                          new TableDataSource(DATA_SOURCE_ARRAYS),
+                          new TableDataSource(CalciteTests.ARRAYS_DATASOURCE),
                           range("__time", ColumnType.LONG, 1672617600000L, 1672704600000L, false, false)
                       ),
                       expressionVirtualColumn("j0.unnest", "\"arrayStringNulls\"", ColumnType.STRING_ARRAY),
@@ -6925,12 +6975,9 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
                   )
                   .intervals(querySegmentSpec(Filtration.eternity()))
                   .filters(
-                      NullHandling.sqlCompatible() ?
-                      or(
-                          equality("m1", 1.0f, ColumnType.FLOAT),
-                          equality("m1", 2.0f, ColumnType.FLOAT)
-                      ) :
-                      new InDimFilter("m1", ImmutableList.of("1", "2"), null)
+                      NullHandling.sqlCompatible()
+                      ? in("m1", ColumnType.FLOAT, ImmutableList.of(1.0f, 2.0f))
+                      : in("m1", ImmutableList.of("1", "2"))
                   )
                   .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
                   .legacy(false)
@@ -6961,7 +7008,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
                               .dataSource(
                                   UnnestDataSource.create(
                                       FilteredDataSource.create(
-                                          new TableDataSource(DATA_SOURCE_ARRAYS),
+                                          new TableDataSource(CalciteTests.ARRAYS_DATASOURCE),
                                           range("__time", ColumnType.LONG, 1672617600000L, 1672704600000L, false, false)
                                       ),
                                       expressionVirtualColumn("j0.unnest", "\"arrayLongNulls\"", ColumnType.LONG_ARRAY),
@@ -6980,7 +7027,7 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
                   )
                   .intervals(querySegmentSpec(Filtration.eternity()))
                   .filters(
-                      expressionFilter("array_contains(\"arrayLongNulls\",array(2))")
+                      new ArrayContainsElementFilter("arrayLongNulls", ColumnType.LONG, 2L, null)
                   )
                   .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
                   .legacy(false)
@@ -7102,6 +7149,418 @@ public class CalciteArraysQueryTest extends BaseCalciteQueryTest
         ),
         ImmutableList.of(
             new Object[]{"a", "xa", "xa"}
+        )
+    );
+  }
+
+  @Test
+  public void testUnnestWithGroupByOnExpression()
+  {
+    cannotVectorize();
+    testQuery(
+        "WITH X as \n"
+        + "(\n"
+        + "SELECT\n"
+        + "ARRAY[1,2,3] as allNums\n"
+        + "FROM foo\n"
+        + "GROUP BY 1\n"
+        + ")\n"
+        + "select * from X CROSS JOIN UNNEST(X.allNums) as ud(num)",
+        QUERY_CONTEXT_UNNEST,
+        ImmutableList.of(
+            Druids.newScanQueryBuilder()
+                  .dataSource(UnnestDataSource.create(
+                                  new QueryDataSource(
+                                      GroupByQuery.builder()
+                                                  .setDataSource(CalciteTests.DATASOURCE1)
+                                                  .setInterval(new MultipleIntervalSegmentSpec(ImmutableList.of(
+                                                      Filtration.eternity())))
+                                                  .setVirtualColumns(expressionVirtualColumn(
+                                                      "v0",
+                                                      "array(1,2,3)",
+                                                      ColumnType.LONG_ARRAY
+                                                  ))
+                                                  .setDimensions(dimensions(
+                                                      new DefaultDimensionSpec(
+                                                          "v0",
+                                                          "d0",
+                                                          ColumnType.LONG_ARRAY
+                                                      )
+                                                  ))
+                                                  .setGranularity(Granularities.ALL)
+                                                  .setContext(QUERY_CONTEXT_DEFAULT)
+                                                  .build()),
+                                  expressionVirtualColumn(
+                                      "j0.unnest",
+                                      "array(1,2,3)",
+                                      ColumnType.LONG_ARRAY
+                                  ),
+                                  null
+                              )
+                  )
+                  .eternityInterval()
+                  .columns("d0", "j0.unnest")
+                  .legacy(false)
+                  .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
+                  .context(QUERY_CONTEXT_DEFAULT)
+                  .build()
+        ),
+        ImmutableList.of(
+            new Object[]{ImmutableList.of(1L, 2L, 3L), 1},
+            new Object[]{ImmutableList.of(1L, 2L, 3L), 2},
+            new Object[]{ImmutableList.of(1L, 2L, 3L), 3}
+        )
+    );
+  }
+
+  @Test
+  public void testArrayToMvPostaggInline()
+  {
+    cannotVectorize();
+    testQuery(
+        "WITH \"ext\" AS (\n"
+        + "  SELECT\n"
+        + "    CAST(\"c0\" AS TIMESTAMP) AS \"__time\",\n"
+        + "    STRING_TO_ARRAY(\"c1\", '<#>') AS \"strings\",\n"
+        + "    CAST(STRING_TO_ARRAY(\"c2\", '<#>') AS BIGINT ARRAY) AS \"longs\"\n"
+        + "  FROM (\n"
+        + "    VALUES\n"
+        + "    (0, 'A<#>B', '1<#>2'),\n"
+        + "    (0, 'C<#>D', '3<#>4')\n"
+        + "  ) AS \"t\" (\"c0\", \"c1\", \"c2\")\n"
+        + ")\n"
+        + "SELECT\n"
+        + "  ARRAY_TO_MV(\"strings\") AS \"strings\",\n"
+        + "  ARRAY_TO_MV(\"longs\") AS \"longs\",\n"
+        + "  COUNT(*) AS \"count\"\n"
+        + "FROM \"ext\"\n"
+        + "GROUP BY \"strings\", \"longs\"",
+        ImmutableList.of(
+            GroupByQuery.builder()
+                        .setDataSource(
+                            InlineDataSource.fromIterable(
+                                Arrays.asList(
+                                    new Object[]{0L, "A<#>B", "1<#>2"},
+                                    new Object[]{0L, "C<#>D", "3<#>4"}
+                                ),
+                                RowSignature.builder()
+                                            .add("c0", ColumnType.LONG)
+                                            .add("c1", ColumnType.STRING)
+                                            .add("c2", ColumnType.STRING)
+                                            .build()
+                            )
+                        )
+                        .setQuerySegmentSpec(new MultipleIntervalSegmentSpec(ImmutableList.of(Intervals.ETERNITY)))
+                        .setDimensions(
+                            new DefaultDimensionSpec("v0", "d0", ColumnType.STRING_ARRAY),
+                            new DefaultDimensionSpec("v1", "d1", ColumnType.LONG_ARRAY)
+                        )
+                        .setVirtualColumns(
+                            new ExpressionVirtualColumn(
+                                "v0",
+                                "string_to_array(\"c1\",'<#>')",
+                                ColumnType.STRING_ARRAY,
+                                TestExprMacroTable.INSTANCE
+                            ),
+                            new ExpressionVirtualColumn(
+                                "v1",
+                                "CAST(string_to_array(\"c2\",'<#>'), 'ARRAY<LONG>')",
+                                ColumnType.LONG_ARRAY,
+                                TestExprMacroTable.INSTANCE
+                            )
+                        )
+                        .setAggregatorSpecs(
+                            new CountAggregatorFactory("a0")
+                        )
+                        .setPostAggregatorSpecs(
+                            new ExpressionPostAggregator(
+                                "p0",
+                                "array_to_mv(\"d0\")",
+                                null,
+                                ColumnType.STRING,
+                                TestExprMacroTable.INSTANCE
+                            ),
+                            new ExpressionPostAggregator(
+                                "p1",
+                                "array_to_mv(\"d1\")",
+                                null,
+                                ColumnType.STRING,
+                                TestExprMacroTable.INSTANCE
+                            )
+                        )
+                        .setGranularity(Granularities.ALL)
+                        .setContext(QUERY_CONTEXT_DEFAULT)
+                        .build()
+        ),
+        ImmutableList.of(
+            new Object[]{"[\"A\",\"B\"]", "[\"1\",\"2\"]", 1L},
+            new Object[]{"[\"C\",\"D\"]", "[\"3\",\"4\"]", 1L}
+        ),
+        RowSignature.builder()
+                    .add("strings", ColumnType.STRING)
+                    .add("longs", ColumnType.STRING)
+                    .add("count", ColumnType.LONG)
+                    .build()
+    );
+  }
+
+  @Test
+  public void testUnnestExtractionFn()
+  {
+    testQuery(
+        "SELECT substring(d3,1) FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3) WHERE substring(d3,1) <> 'b'",
+        QUERY_CONTEXT_UNNEST,
+        ImmutableList.of(
+            Druids.newScanQueryBuilder()
+                  .dataSource(UnnestDataSource.create(
+                      new TableDataSource(CalciteTests.DATASOURCE3),
+                      expressionVirtualColumn("j0.unnest", "\"dim3\"", ColumnType.STRING),
+                      NullHandling.sqlCompatible()
+                      ? expressionFilter("(substring(\"j0.unnest\", 0, -1) != 'b')")
+                      : not(selector("j0.unnest", "b", new SubstringDimExtractionFn(0, null)))
+                  ))
+                  .virtualColumns(expressionVirtualColumn("v0", "substring(\"j0.unnest\", 0, -1)", ColumnType.STRING))
+                  .intervals(querySegmentSpec(Filtration.eternity()))
+                  .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
+                  .legacy(false)
+                  .context(QUERY_CONTEXT_UNNEST)
+                  .columns(ImmutableList.of("v0"))
+                  .build()
+        ),
+        useDefault ?
+        ImmutableList.of(
+            new Object[]{"a"},
+            new Object[]{"c"},
+            new Object[]{"d"},
+            new Object[]{""},
+            new Object[]{""},
+            new Object[]{""}
+        ) :
+        ImmutableList.of(
+            new Object[]{"a"},
+            new Object[]{"c"},
+            new Object[]{"d"}
+        )
+    );
+  }
+
+  @Test
+  public void testUnnestExtractionFnNull()
+  {
+    testQuery(
+        "SELECT substring(d3,1) FROM druid.numfoo, UNNEST(MV_TO_ARRAY(dim3)) as unnested (d3) WHERE substring(d3,1) is not null",
+        QUERY_CONTEXT_UNNEST,
+        ImmutableList.of(
+            Druids.newScanQueryBuilder()
+                  .dataSource(UnnestDataSource.create(
+                      new TableDataSource(CalciteTests.DATASOURCE3),
+                      expressionVirtualColumn("j0.unnest", "\"dim3\"", ColumnType.STRING),
+                      NullHandling.sqlCompatible()
+                      ? expressionFilter("notnull(substring(\"j0.unnest\", 0, -1))")
+                      : not(selector("j0.unnest", null, new SubstringDimExtractionFn(0, null)))
+                  ))
+                  .virtualColumns(expressionVirtualColumn("v0", "substring(\"j0.unnest\", 0, -1)", ColumnType.STRING))
+                  .intervals(querySegmentSpec(Filtration.eternity()))
+                  .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
+                  .legacy(false)
+                  .context(QUERY_CONTEXT_UNNEST)
+                  .columns(ImmutableList.of("v0"))
+                  .build()
+        ),
+        ImmutableList.of(
+            new Object[]{"a"},
+            new Object[]{"b"},
+            new Object[]{"b"},
+            new Object[]{"c"},
+            new Object[]{"d"}
+        )
+    );
+  }
+
+  @Test
+  public void testBooleanConstExprArray()
+  {
+    ExprEval exprEval = ExprEval.ofArray(ExpressionType.LONG_ARRAY, new Long[]{1L, 0L, null});
+    testQuery(
+        "SELECT ARRAY[true, false, null] FROM druid.numfoo LIMIT 1",
+        ImmutableList.of(
+            newScanQueryBuilder()
+                .dataSource(CalciteTests.DATASOURCE3)
+                .intervals(querySegmentSpec(Filtration.eternity()))
+                .virtualColumns(new ExpressionVirtualColumn(
+                    "v0",
+                    "array(1,0,null)",
+                    exprEval.toExpr(),
+                    ColumnType.LONG_ARRAY
+                ))
+                .columns("v0")
+                .resultFormat(ScanQuery.ResultFormat.RESULT_FORMAT_COMPACTED_LIST)
+                .limit(1)
+                .context(QUERY_CONTEXT_DEFAULT)
+                .build()
+        ),
+        ImmutableList.of(
+            new Object[]{"[1,0,null]"}
+        )
+    );
+  }
+
+  @Test
+  public void testGroupByNestedArrayInline()
+  {
+    cannotVectorize();
+    // msq does not support nested arrays currently
+    msqIncompatible();
+    testQuery(
+        "SELECT c1, ARRAY_PREPEND('1', ARRAY_AGG(ARRAY[1,c2], 100000)) c5 \n"
+        + "FROM (VALUES (1,1),(2,2),(3,3)) t(c1,c2)\n"
+        + "GROUP BY 1 \n"
+        + "HAVING ARRAY_PREPEND('1', ARRAY_AGG(ARRAY[1,c2], 100000)) <> ARRAY_PREPEND('0', ARRAY_AGG(ARRAY[1,c2], 100000))",
+        QUERY_CONTEXT_NO_STRINGIFY_ARRAY,
+        ImmutableList.of(
+            GroupByQuery.builder()
+                        .setDataSource(
+                            InlineDataSource.fromIterable(
+                                ImmutableList.of(
+                                    new Object[]{1L, 1L},
+                                    new Object[]{2L, 2L},
+                                    new Object[]{3L, 3L}
+                                ),
+                                RowSignature.builder()
+                                            .add("c1", ColumnType.LONG)
+                                            .add("c2", ColumnType.LONG)
+                                            .build()
+                            )
+                        )
+                        .setInterval(querySegmentSpec(Filtration.eternity()))
+                        .setGranularity(Granularities.ALL)
+                        .setVirtualColumns(
+                            expressionVirtualColumn(
+                            "v0",
+                            "array(1,\"c2\")",
+                            ColumnType.LONG_ARRAY
+                            )
+                        )
+                        .setDimensions(new DefaultDimensionSpec("c1", "d0", ColumnType.LONG))
+                        .setAggregatorSpecs(
+                            new ExpressionLambdaAggregatorFactory(
+                                "a0",
+                                ImmutableSet.of("v0"),
+                                "__acc",
+                                "ARRAY<ARRAY<LONG>>[]",
+                                "ARRAY<ARRAY<LONG>>[]",
+                                true,
+                                true,
+                                false,
+                                "array_append(\"__acc\", \"v0\")",
+                                "array_concat(\"__acc\", \"a0\")",
+                                null,
+                                null,
+                                HumanReadableBytes.valueOf(100000),
+                                TestExprMacroTable.INSTANCE
+                            )
+                        )
+                        .setPostAggregatorSpecs(
+                            expressionPostAgg(
+                                "p0",
+                                "array_prepend('1',\"a0\")",
+                                ColumnType.ofArray(ColumnType.LONG_ARRAY)
+                            )
+                        )
+                        .setHavingSpec(
+                            new DimFilterHavingSpec(
+                                expressionFilter("(array_prepend('1',\"a0\") != array_prepend('0',\"a0\"))"),
+                                true
+                            )
+                        )
+                        .setContext(QUERY_CONTEXT_DEFAULT)
+                        .build()
+        ),
+        ImmutableList.of(
+            new Object[]{1, ImmutableList.of(ImmutableList.of(1L), ImmutableList.of(1L, 1L))},
+            new Object[]{2, ImmutableList.of(ImmutableList.of(1L), ImmutableList.of(1L, 2L))},
+            new Object[]{3, ImmutableList.of(ImmutableList.of(1L), ImmutableList.of(1L, 3L))}
+        )
+    );
+  }
+
+  @Test
+  public void testGroupByNestedArrayInlineCount()
+  {
+    cannotVectorize();
+    // msq does not support nested arrays currently
+    msqIncompatible();
+    testQuery(
+        "SELECT COUNT(*) c FROM (\n"
+        + "SELECT c1, ARRAY_PREPEND('1', ARRAY_AGG(ARRAY[1,c2], 100000)) c5 \n"
+        + "FROM (VALUES (1,1),(2,2),(3,3)) t(c1,c2)\n"
+        + "GROUP BY 1 \n"
+        + "HAVING ARRAY_PREPEND('1', ARRAY_AGG(ARRAY[1,c2], 100000)) <> ARRAY_PREPEND('0', ARRAY_AGG(ARRAY[1,c2], 100000))\n"
+        + ")",
+        QUERY_CONTEXT_NO_STRINGIFY_ARRAY,
+        ImmutableList.of(
+            GroupByQuery.builder()
+                        .setDataSource(
+                            GroupByQuery.builder()
+                                        .setDataSource(
+                                            InlineDataSource.fromIterable(
+                                                ImmutableList.of(
+                                                    new Object[]{1L, 1L},
+                                                    new Object[]{2L, 2L},
+                                                    new Object[]{3L, 3L}
+                                                ),
+                                                RowSignature.builder()
+                                                            .add("c1", ColumnType.LONG)
+                                                            .add("c2", ColumnType.LONG)
+                                                            .build()
+                                            )
+                                        )
+                                        .setInterval(querySegmentSpec(Filtration.eternity()))
+                                        .setGranularity(Granularities.ALL)
+                                        .setVirtualColumns(
+                                            expressionVirtualColumn(
+                                                "v0",
+                                                "array(1,\"c2\")",
+                                                ColumnType.LONG_ARRAY
+                                            )
+                                        )
+                                        .setDimensions(new DefaultDimensionSpec("c1", "d0", ColumnType.LONG))
+                                        .setAggregatorSpecs(
+                                            new ExpressionLambdaAggregatorFactory(
+                                                "a0",
+                                                ImmutableSet.of("v0"),
+                                                "__acc",
+                                                "ARRAY<ARRAY<LONG>>[]",
+                                                "ARRAY<ARRAY<LONG>>[]",
+                                                true,
+                                                true,
+                                                false,
+                                                "array_append(\"__acc\", \"v0\")",
+                                                "array_concat(\"__acc\", \"a0\")",
+                                                null,
+                                                null,
+                                                HumanReadableBytes.valueOf(100000),
+                                                TestExprMacroTable.INSTANCE
+                                            )
+                                        )
+                                        .setHavingSpec(
+                                            new DimFilterHavingSpec(
+                                                expressionFilter(
+                                                    "(array_prepend('1',\"a0\") != array_prepend('0',\"a0\"))"),
+                                                true
+                                            )
+                                        )
+                                        .setContext(QUERY_CONTEXT_DEFAULT)
+                                        .build()
+                        )
+                        .setInterval(querySegmentSpec(Filtration.eternity()))
+                        .setGranularity(Granularities.ALL)
+                        .setAggregatorSpecs(new CountAggregatorFactory("_a0"))
+                        .setContext(QUERY_CONTEXT_DEFAULT)
+                        .build()
+        ),
+        ImmutableList.of(
+            new Object[]{3L}
         )
     );
   }

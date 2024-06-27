@@ -28,10 +28,8 @@ import io.fabric8.kubernetes.api.model.batch.v1.JobBuilder;
 import org.apache.commons.io.IOUtils;
 import org.apache.druid.indexer.RunnerTaskState;
 import org.apache.druid.indexer.TaskLocation;
-import org.apache.druid.indexer.TaskState;
 import org.apache.druid.indexer.TaskStatus;
 import org.apache.druid.indexing.common.task.Task;
-import org.apache.druid.indexing.overlord.TaskRunnerListener;
 import org.apache.druid.indexing.overlord.TaskRunnerWorkItem;
 import org.apache.druid.java.util.emitter.service.ServiceEmitter;
 import org.apache.druid.java.util.emitter.service.ServiceEventBuilder;
@@ -77,9 +75,7 @@ public class KubernetesTaskRunnerTest extends EasyMockSupport
   @Mock private KubernetesPeonClient peonClient;
   @Mock private KubernetesPeonLifecycle kubernetesPeonLifecycle;
   @Mock private ServiceEmitter emitter;
-
-  @Mock private Executor executor;
-  @Mock private TaskRunnerListener taskRunnerListener;
+  @Mock private ListenableFuture<TaskStatus> statusFuture;
 
   private KubernetesTaskRunnerConfig config;
   private KubernetesTaskRunner runner;
@@ -121,7 +117,11 @@ public class KubernetesTaskRunnerTest extends EasyMockSupport
       {
         return tasks.computeIfAbsent(
             task.getId(),
-            k -> new KubernetesWorkItem(task)).getResult();
+            k -> new KubernetesWorkItem(
+                task,
+                Futures.immediateFuture(TaskStatus.success(task.getId()))
+            )
+        ).getResult();
       }
     };
 
@@ -250,7 +250,7 @@ public class KubernetesTaskRunnerTest extends EasyMockSupport
   }
 
   @Test
-  public void test_run_whenExceptionThrown_throwsRuntimeException() throws Exception
+  public void test_run_whenExceptionThrown_throwsRuntimeException() throws IOException
   {
     Job job = new JobBuilder()
         .withNewMetadata()
@@ -270,89 +270,11 @@ public class KubernetesTaskRunnerTest extends EasyMockSupport
     replayAll();
 
     ListenableFuture<TaskStatus> future = runner.run(task);
-    TaskStatus taskStatus = future.get();
-    Assert.assertEquals(TaskState.FAILED, taskStatus.getStatusCode());
-    Assert.assertEquals("Could not start task execution", taskStatus.getErrorMsg());
+
+    Exception e = Assert.assertThrows(ExecutionException.class, future::get);
+    Assert.assertTrue(e.getCause() instanceof RuntimeException);
+
     verifyAll();
-  }
-
-  @Test
-  public void test_run_updateStatus() throws ExecutionException, InterruptedException
-  {
-    KubernetesTaskRunner runner = new KubernetesTaskRunner(
-        taskAdapter,
-        config,
-        peonClient,
-        httpClient,
-        new TestPeonLifecycleFactory(kubernetesPeonLifecycle),
-        emitter
-    );
-
-    KubernetesWorkItem workItem = new KubernetesWorkItem(task);
-    runner.tasks.put(task.getId(), workItem);
-    TaskStatus completeTaskStatus = TaskStatus.success(task.getId());
-
-    replayAll();
-    runner.updateStatus(task, completeTaskStatus);
-    verifyAll();
-
-    assertTrue(workItem.getResult().isDone());
-    assertEquals(completeTaskStatus, workItem.getResult().get());
-  }
-
-  @Test
-  public void test_run_updateStatus_running()
-  {
-    KubernetesTaskRunner runner = new KubernetesTaskRunner(
-        taskAdapter,
-        config,
-        peonClient,
-        httpClient,
-        new TestPeonLifecycleFactory(kubernetesPeonLifecycle),
-        emitter
-    );
-    KubernetesWorkItem workItem = new KubernetesWorkItem(task);
-    runner.tasks.put(task.getId(), workItem);
-    TaskStatus runningTaskStatus = TaskStatus.running(task.getId());
-
-    replayAll();
-    runner.updateStatus(task, runningTaskStatus);
-    verifyAll();
-
-    assertFalse(workItem.getResult().isDone());
-  }
-
-  @Test
-  public void test_registerListener_runningTask()
-  {
-    KubernetesTaskRunner runner = new KubernetesTaskRunner(
-        taskAdapter,
-        config,
-        peonClient,
-        httpClient,
-        new TestPeonLifecycleFactory(kubernetesPeonLifecycle),
-        emitter
-    );
-
-    KubernetesPeonLifecycle runningKubernetesPeonLifecycle = EasyMock.mock(KubernetesPeonLifecycle.class);
-    EasyMock.expect(runningKubernetesPeonLifecycle.getState()).andReturn(KubernetesPeonLifecycle.State.RUNNING);
-    EasyMock.expect(runningKubernetesPeonLifecycle.getTaskLocation()).andReturn(TaskLocation.unknown());
-    KubernetesWorkItem workItem = new KubernetesWorkItem(task);
-    workItem.setKubernetesPeonLifecycle(runningKubernetesPeonLifecycle);
-    runner.tasks.put(task.getId(), workItem);
-
-    Executor executor = EasyMock.mock(Executor.class);
-    TaskRunnerListener taskRunnerListener = EasyMock.mock(TaskRunnerListener.class);
-    executor.execute(EasyMock.anyObject());
-    EasyMock.expectLastCall();
-    taskRunnerListener.locationChanged(EasyMock.anyObject(), EasyMock.anyObject());
-    EasyMock.expectLastCall();
-
-    replayAll();
-    EasyMock.replay(runningKubernetesPeonLifecycle);
-    runner.registerListener(taskRunnerListener, executor);
-    verifyAll();
-    EasyMock.verify(runningKubernetesPeonLifecycle);
   }
 
   @Test
@@ -382,15 +304,16 @@ public class KubernetesTaskRunnerTest extends EasyMockSupport
   }
 
   @Test
-  public void test_join_whenExceptionThrown_throwsRuntimeException() throws ExecutionException, InterruptedException
+  public void test_join_whenExceptionThrown_throwsRuntimeException()
   {
     EasyMock.expect(kubernetesPeonLifecycle.join(EasyMock.anyLong())).andThrow(new IllegalStateException());
 
     replayAll();
 
     ListenableFuture<TaskStatus> future = runner.joinAsync(task);
-    TaskStatus taskStatus = future.get();
-    Assert.assertEquals(TaskState.FAILED, taskStatus.getStatusCode());
+
+    Exception e = Assert.assertThrows(ExecutionException.class, future::get);
+    Assert.assertTrue(e.getCause() instanceof RuntimeException);
 
     verifyAll();
   }
@@ -408,16 +331,35 @@ public class KubernetesTaskRunnerTest extends EasyMockSupport
   @Test
   public void test_shutdown_withExistingTask_removesTaskFromMap()
   {
-    KubernetesWorkItem workItem = new KubernetesWorkItem(task, null) {
+    KubernetesWorkItem workItem = new KubernetesWorkItem(task, statusFuture) {
       @Override
       protected synchronized void shutdown()
       {
       }
     };
-
+    EasyMock.expect(statusFuture.isDone()).andReturn(true).anyTimes();
+    replayAll();
     runner.tasks.put(task.getId(), workItem);
     runner.shutdown(task.getId(), "");
     Assert.assertTrue(runner.tasks.isEmpty());
+    verifyAll();
+  }
+
+  @Test
+  public void test_shutdown_withExistingTask_futureIncomplete_removesTaskFromMap()
+  {
+    KubernetesWorkItem workItem = new KubernetesWorkItem(task, statusFuture) {
+      @Override
+      protected synchronized void shutdown()
+      {
+      }
+    };
+    EasyMock.expect(statusFuture.isDone()).andReturn(false).anyTimes();
+    replayAll();
+    runner.tasks.put(task.getId(), workItem);
+    runner.shutdown(task.getId(), "");
+    Assert.assertEquals(1, runner.tasks.size());
+    verifyAll();
   }
 
   @Test

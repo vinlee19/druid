@@ -90,7 +90,19 @@ public class GroupingSqlAggregator implements SqlAggregator
         }
       }
     }
-    AggregatorFactory factory = new GroupingAggregatorFactory(name, arguments);
+    AggregatorFactory factory;
+    try {
+      factory = new GroupingAggregatorFactory(name, arguments);
+    }
+    catch (Exception e) {
+      plannerContext.setPlanningError(
+          "Initialisation of Grouping Aggregator Factory in case of [%s] threw [%s]",
+          aggregateCall,
+          e.getMessage()
+      );
+      return null;
+    }
+
     return Aggregation.create(factory);
   }
 
@@ -116,10 +128,13 @@ public class GroupingSqlAggregator implements SqlAggregator
       return expression.getDirectColumn();
     }
 
-    String virtualColumn = virtualColumnRegistry.getOrCreateVirtualColumnForExpression(
+    if (expression.isSimpleExtraction()) {
+      return expression.getSimpleExtraction().getColumn();
+    }
+
+    return virtualColumnRegistry.getOrCreateVirtualColumnForExpression(
         expression,
         node.getType()
     );
-    return virtualColumn;
   }
 }
